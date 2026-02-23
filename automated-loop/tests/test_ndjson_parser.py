@@ -10,6 +10,7 @@ from ndjson_parser import (
     extract_result,
     parse_ndjson_line,
     parse_ndjson_string,
+    parse_opencode_output,
     process_events,
 )
 
@@ -211,3 +212,88 @@ class TestExtractResult:
         result = extract_result(events)
         assert result is not None
         assert result.session_id == "err-456"  # last result event
+
+
+class TestParseOpencodeOutput:
+    """Tests for parse_opencode_output — OpenCode -f json response parsing."""
+
+    def test_json_format_response(self) -> None:
+        """JSON format output is parsed correctly."""
+        stdout = json.dumps({"response": "Here is your implementation."})
+        parsed = parse_opencode_output(stdout, session_id="sid-1")
+        assert parsed.assistant_text == "Here is your implementation."
+        assert parsed.result is not None
+        assert parsed.result.result_text == "Here is your implementation."
+
+    def test_result_session_id_matches_argument(self) -> None:
+        """session_id argument is propagated to ParsedStream and ClaudeResult."""
+        stdout = json.dumps({"response": "Done."})
+        parsed = parse_opencode_output(stdout, session_id="test-session")
+        assert parsed.session_id == "test-session"
+        assert parsed.result is not None
+        assert parsed.result.session_id == "test-session"
+
+    def test_duration_ms_propagated(self) -> None:
+        """duration_ms argument is stored in ClaudeResult.duration_ms."""
+        stdout = json.dumps({"response": "Done."})
+        parsed = parse_opencode_output(stdout, session_id="s1", duration_ms=12345.0)
+        assert parsed.result is not None
+        assert parsed.result.duration_ms == 12345.0
+
+    def test_cost_is_zero(self) -> None:
+        """OpenCode does not report cost — cost_usd is always 0.0."""
+        stdout = json.dumps({"response": "Done."})
+        parsed = parse_opencode_output(stdout, session_id="s1")
+        assert parsed.result is not None
+        assert parsed.result.cost_usd == 0.0
+
+    def test_num_turns_is_one(self) -> None:
+        """num_turns defaults to 1 since OpenCode does not report turn count."""
+        stdout = json.dumps({"response": "Done."})
+        parsed = parse_opencode_output(stdout, session_id="s1")
+        assert parsed.result is not None
+        assert parsed.result.num_turns == 1
+
+    def test_is_error_false(self) -> None:
+        """is_error is False since OpenCode does not distinguish errors in output."""
+        stdout = json.dumps({"response": "Done."})
+        parsed = parse_opencode_output(stdout, session_id="s1")
+        assert parsed.result is not None
+        assert parsed.result.is_error is False
+
+    def test_plain_text_fallback(self) -> None:
+        """Non-JSON stdout is treated as plain-text response."""
+        parsed = parse_opencode_output("Here is your answer.", session_id="s1")
+        assert parsed.assistant_text == "Here is your answer."
+        assert parsed.result is not None
+        assert parsed.result.result_text == "Here is your answer."
+
+    def test_empty_stdout_returns_empty_stream(self) -> None:
+        """Empty stdout produces a ParsedStream with no result."""
+        parsed = parse_opencode_output("", session_id="s1")
+        assert parsed.result is None
+        assert parsed.assistant_text == ""
+
+    def test_whitespace_only_stdout_returns_empty_stream(self) -> None:
+        """Whitespace-only stdout produces a ParsedStream with no result."""
+        parsed = parse_opencode_output("   \n\t  ", session_id="s1")
+        assert parsed.result is None
+
+    def test_multiline_response_preserved(self) -> None:
+        """Multi-line response text is preserved exactly."""
+        text = "Line 1\nLine 2\nLine 3"
+        stdout = json.dumps({"response": text})
+        parsed = parse_opencode_output(stdout, session_id="s1")
+        assert parsed.assistant_text == text
+
+    def test_no_tools_tracked(self) -> None:
+        """tools_used is empty since OpenCode output has no tool events."""
+        stdout = json.dumps({"response": "Done."})
+        parsed = parse_opencode_output(stdout, session_id="s1")
+        assert len(parsed.tools_used) == 0
+
+    def test_no_files_modified_tracked(self) -> None:
+        """files_modified is empty since OpenCode output has no file events."""
+        stdout = json.dumps({"response": "Done."})
+        parsed = parse_opencode_output(stdout, session_id="s1")
+        assert len(parsed.files_modified) == 0

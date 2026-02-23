@@ -93,16 +93,19 @@ class LoopDriver:
                 "Review the current project. List the main files and their purpose briefly. "
                 "Then output PROJECT_COMPLETE."
             )
-        # Check for CLAUDE.md in project dir or parent (Claude CLI searches up)
-        claude_md = self.project_path / "CLAUDE.md"
-        if not claude_md.exists():
-            claude_md = self.project_path.parent / "CLAUDE.md"
-        if claude_md.exists():
-            return (
-                "Read CLAUDE.md first — it contains the current roadmap with phases and their status. "
-                "Implement the first phase marked TODO. Do NOT output PROJECT_COMPLETE unless "
-                "every phase in CLAUDE.md is marked COMPLETE."
-            )
+        # Check for project blueprint files.  OpenCode uses OpenCode.md; Claude
+        # Code uses CLAUDE.md.  Both formats are supported.
+        for blueprint_name in ("OpenCode.md", "CLAUDE.md"):
+            blueprint = self.project_path / blueprint_name
+            if not blueprint.exists():
+                blueprint = self.project_path.parent / blueprint_name
+            if blueprint.exists():
+                return (
+                    f"Read {blueprint_name} first — it contains the current roadmap with phases "
+                    "and their status. "
+                    "Implement the first phase marked TODO. Do NOT output PROJECT_COMPLETE unless "
+                    f"every phase in {blueprint_name} is marked COMPLETE."
+                )
         return "Review the project and continue implementation from where we left off."
 
     def _write_trace_event(self, event_type: str, **data) -> None:

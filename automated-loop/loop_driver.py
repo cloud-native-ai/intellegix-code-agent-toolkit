@@ -1,8 +1,9 @@
-"""Cross-platform Python loop driver for automated Claude Code + Perplexity research.
+"""Cross-platform Python loop driver for automated OpenCode + Perplexity research.
 
 Primary entry point — replaces PowerShell as the main loop driver.
-Uses subprocess.Popen() to stream NDJSON from claude CLI line-by-line,
-handling the Windows hang bug (#25629) where stdout doesn't close after result.
+Uses subprocess.Popen() to invoke the OpenCode CLI in non-interactive mode
+(-p / --prompt flag with -f json output), reads stdout until EOF, and parses
+the resulting JSON response.
 """
 
 from __future__ import annotations
@@ -15,13 +16,14 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from config import Result, RetryConfig, WorkflowConfig, load_config
 from log_redactor import RedactingFilter
-from ndjson_parser import ParsedStream, parse_ndjson_line, process_events
+from ndjson_parser import ParsedStream, parse_opencode_output
 from research_bridge import ResearchBridge
 from state_tracker import StateTracker
 
@@ -47,7 +49,7 @@ class JsonFormatter(logging.Formatter):
 
 
 class LoopDriver:
-    """Orchestrates the Claude Code -> Perplexity research loop."""
+    """Orchestrates the OpenCode -> Perplexity research loop."""
 
     def __init__(
         self,
@@ -128,22 +130,22 @@ class LoopDriver:
         return min(base * (2 ** (timeout_count - 1)), cap)
 
     def _preflight_check(self) -> bool:
-        """Verify Claude CLI is accessible before starting iterations."""
+        """Verify OpenCode CLI is accessible before starting iterations."""
         try:
             result = subprocess.run(
-                ["claude", "--version"],
+                ["opencode", "--version"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
-                logger.error("Claude CLI preflight failed: %s", result.stderr[:200])
+                logger.error("OpenCode CLI preflight failed: %s", result.stderr[:200])
                 return False
-            logger.info("Claude CLI preflight OK: %s", result.stdout.strip()[:100])
+            logger.info("OpenCode CLI preflight OK: %s", result.stdout.strip()[:100])
             return True
         except FileNotFoundError:
-            logger.error("Claude CLI not found on PATH")
+            logger.error("OpenCode CLI not found on PATH")
             return False
         except subprocess.TimeoutExpired:
-            logger.error("Claude CLI preflight timed out (30s)")
+            logger.error("OpenCode CLI preflight timed out (30s)")
             return False
 
     def run(self) -> int:
@@ -151,19 +153,19 @@ class LoopDriver:
         logger.info("=" * 60)
         if self.smoke_test:
             logger.info("*** SMOKE TEST MODE ***")
-        logger.info("Automated Claude Loop Driver (Python)")
+        logger.info("Automated OpenCode Loop Driver (Python)")
         logger.info("Project: %s", self.project_path)
         logger.info("Max iterations: %d", self.config.limits.max_iterations)
         timeout_multiplier = self.config.limits.model_timeout_multipliers.get(
-            self.config.claude.model, 1.0
+            self.config.opencode.model, 1.0
         )
         effective_timeout = int(self.config.limits.timeout_seconds * timeout_multiplier)
         logger.info(
             "Timeout: %ds per iteration (base: %ds, multiplier: %.1fx for %s)",
             effective_timeout, self.config.limits.timeout_seconds,
-            timeout_multiplier, self.config.claude.model,
+            timeout_multiplier, self.config.opencode.model,
         )
-        logger.info("Model: %s", self.config.claude.model)
+        logger.info("Model: %s", self.config.opencode.model)
         logger.info("Dry run: %s", self.dry_run)
         logger.info("=" * 60)
 
@@ -179,7 +181,7 @@ class LoopDriver:
         self._write_trace_event(
             "loop_start",
             max_iterations=self.config.limits.max_iterations,
-            model=self.config.claude.model,
+            model=self.config.opencode.model,
             dry_run=self.dry_run,
             smoke_test=self.smoke_test,
         )
@@ -197,16 +199,16 @@ class LoopDriver:
             logger.info("Prompt: %s...", current_prompt[:200])
 
             self._write_trace_event(
-                "claude_invoke",
+                "opencode_invoke",
                 prompt_preview=current_prompt[:200],
                 session_id=session_id,
             )
 
             start_time = time.monotonic()
-            parsed = self._invoke_claude(current_prompt, session_id)
+            parsed = self._invoke_opencode(current_prompt, session_id)
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
-            # Track session ID for --resume
+            # Track session ID for state continuity
             if parsed.session_id:
                 session_id = parsed.session_id
 
@@ -224,7 +226,7 @@ class LoopDriver:
             is_error = parsed.result.is_error if parsed.result else bool(parsed.errors)
 
             self._write_trace_event(
-                "claude_complete",
+                "opencode_complete",
                 session_id=parsed.session_id,
                 cost_usd=cost_usd,
                 num_turns=num_turns,
@@ -299,7 +301,7 @@ class LoopDriver:
                 # Phase 4: Model fallback — try fallback model before stagnation exit
                 fallback_threshold = self.config.limits.model_fallback_after_timeouts
                 fallback_model = self.config.limits.model_fallback.get(
-                    self.config.claude.model
+                    self.config.opencode.model
                 )
                 if (
                     self._consecutive_timeouts >= fallback_threshold
@@ -308,16 +310,16 @@ class LoopDriver:
                 ):
                     logger.warning(
                         "Falling back from %s to %s after %d timeouts",
-                        self.config.claude.model, fallback_model,
+                        self.config.opencode.model, fallback_model,
                         self._consecutive_timeouts,
                     )
                     self._write_trace_event(
                         "model_fallback",
-                        from_model=self.config.claude.model,
+                        from_model=self.config.opencode.model,
                         to_model=fallback_model,
                     )
-                    self._original_model = self.config.claude.model
-                    self.config.claude.model = fallback_model
+                    self._original_model = self.config.opencode.model
+                    self.config.opencode.model = fallback_model
                     self._using_fallback = True
                     self._consecutive_timeouts = 0  # Reset counter for fallback model
                     current_prompt = self.initial_prompt
@@ -332,7 +334,7 @@ class LoopDriver:
                 # Apply model-aware consecutive timeout limit
                 max_timeouts = self.config.stagnation.max_consecutive_timeouts
                 model_timeout_override = self.config.stagnation.model_timeout_overrides.get(
-                    self.config.claude.model
+                    self.config.opencode.model
                 )
                 if model_timeout_override is not None:
                     max_timeouts = model_timeout_override
@@ -373,19 +375,19 @@ class LoopDriver:
                 ):
                     logger.info(
                         "Reverting from fallback %s to primary %s",
-                        self.config.claude.model, self._original_model,
+                        self.config.opencode.model, self._original_model,
                     )
                     self._write_trace_event(
                         "model_fallback_revert",
-                        from_model=self.config.claude.model,
+                        from_model=self.config.opencode.model,
                         to_model=self._original_model,
                     )
-                    self.config.claude.model = self._original_model
+                    self.config.opencode.model = self._original_model
                     self._using_fallback = False
 
             # Check for errors
             if is_error:
-                logger.warning("Claude returned an error. Clearing session for fresh start.")
+                logger.warning("OpenCode returned an error. Clearing session for fresh start.")
                 self.tracker.clear_session()
                 session_id = None
                 current_prompt = (
@@ -478,44 +480,28 @@ class LoopDriver:
         self._write_metrics_summary(EXIT_MAX_ITERATIONS)
         return EXIT_MAX_ITERATIONS
 
-    def _invoke_claude(
+    def _invoke_opencode(
         self, prompt: str, resume_session_id: Optional[str] = None
     ) -> ParsedStream:
-        """Spawn claude CLI and stream NDJSON output line-by-line.
+        """Spawn the OpenCode CLI in non-interactive mode and collect its output.
 
-        Uses subprocess.Popen instead of subprocess.run to handle the Windows
-        hang bug (#25629) where Claude CLI doesn't close stdout after the result
-        event. We read line-by-line, stop when we see the result event, and kill
-        the process ourselves.
+        Runs ``opencode -p <prompt> -f json -q [--model <model>]`` and waits
+        for the process to finish (or be killed by the timeout timer).
+
+        ``resume_session_id`` is accepted for API compatibility with the state
+        tracker, but OpenCode non-interactive mode does not support session
+        resumption — each invocation starts a new session.
         """
-        # Apply model-aware max-turns cap
-        max_turns = self.config.limits.max_turns_per_iteration
-        model_turns_override = self.config.limits.model_max_turns_override.get(
-            self.config.claude.model
-        )
-        if model_turns_override is not None:
-            max_turns = min(max_turns, model_turns_override)
-            logger.info(
-                "Model %s: capping turns to %d (config: %d)",
-                self.config.claude.model, max_turns,
-                self.config.limits.max_turns_per_iteration,
-            )
-
         args = [
-            "claude", "-p", prompt,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--model", self.config.claude.model,
-            "--max-turns", str(max_turns),
+            "opencode", "-p", prompt,
+            "-f", "json",
+            "-q",
         ]
 
-        if self.config.claude.dangerously_skip_permissions:
-            args.append("--dangerously-skip-permissions")
+        if self.config.opencode.model:
+            args.extend(["--model", self.config.opencode.model])
 
-        if resume_session_id:
-            args.extend(["--resume", resume_session_id])
-
-        logger.info("Spawning: %s", " ".join(args[:6]) + "...")
+        logger.info("Spawning: %s", " ".join(args[:4]) + "...")
 
         if self.dry_run:
             logger.info("[DRY RUN] Would execute: %s", " ".join(args))
@@ -523,7 +509,7 @@ class LoopDriver:
 
         # Apply model-aware timeout multiplier
         timeout_multiplier = self.config.limits.model_timeout_multipliers.get(
-            self.config.claude.model, 1.0
+            self.config.opencode.model, 1.0
         )
         effective_timeout = int(self.config.limits.timeout_seconds * timeout_multiplier)
 
@@ -538,24 +524,23 @@ class LoopDriver:
                 errors="replace",
             )
         except FileNotFoundError:
-            logger.error("claude CLI not found. Ensure 'claude' is on PATH.")
+            logger.error("OpenCode CLI not found. Ensure 'opencode' is on PATH.")
             return ParsedStream()
 
-        # Timer kills process on timeout (handles Windows hang bug)
+        # Timer kills process on timeout
         timed_out = False
 
         def _on_timeout() -> None:
             nonlocal timed_out
             timed_out = True
             logger.warning(
-                "Claude timed out after %ds (base: %ds, multiplier: %.1fx for %s)",
+                "OpenCode timed out after %ds (base: %ds, multiplier: %.1fx for %s)",
                 effective_timeout,
                 self.config.limits.timeout_seconds,
                 timeout_multiplier,
-                self.config.claude.model,
+                self.config.opencode.model,
             )
             self._kill_process_tree(proc.pid)
-            # Fallback: Python-native kill in case taskkill failed
             try:
                 proc.kill()
             except OSError:
@@ -571,18 +556,15 @@ class LoopDriver:
         )
         stderr_thread.start()
 
-        # Read stdout line-by-line, parsing NDJSON events
-        # Use explicit readline() for more responsive pipe reading
-        logger.debug("Claude PID: %d, reading NDJSON events...", proc.pid)
-        events: list = []
-        line_count = 0
+        # Read all stdout until EOF (OpenCode outputs a single JSON object at end)
+        logger.debug("OpenCode PID: %d, reading output...", proc.pid)
+        stdout_chunks: list[str] = []
         deadline = time.monotonic() + effective_timeout + 30  # 30s grace beyond timer
         try:
             while True:
-                # Secondary timeout: break if well past deadline (timer kill failed)
                 if time.monotonic() > deadline:
                     logger.error(
-                        "Readline deadline exceeded (timer kill likely failed). "
+                        "Read deadline exceeded (timer kill likely failed). "
                         "Force-killing PID %d.", proc.pid,
                     )
                     timed_out = True
@@ -592,18 +574,10 @@ class LoopDriver:
                         pass
                     self._kill_process_tree(proc.pid)
                     break
-                line = proc.stdout.readline()
-                if not line:
-                    break  # EOF — pipe closed
-                line_count += 1
-                event = parse_ndjson_line(line)
-                if event:
-                    events.append(event)
-                    logger.debug(
-                        "NDJSON event #%d: type=%s", len(events), event.type
-                    )
-                    if event.type == "result":
-                        break
+                chunk = proc.stdout.readline()
+                if not chunk:
+                    break  # EOF
+                stdout_chunks.append(chunk)
         except (OSError, ValueError):
             pass  # Pipe closed by timeout kill
         finally:
@@ -618,31 +592,29 @@ class LoopDriver:
             except subprocess.TimeoutExpired:
                 pass
 
-        logger.debug(
-            "Read %d lines, %d events from Claude stdout", line_count, len(events)
-        )
-        parsed = process_events(events)
+        stdout_text = "".join(stdout_chunks)
+        logger.debug("Read %d chars from OpenCode stdout", len(stdout_text))
 
         # Log stderr
         stderr_thread.join(timeout=2)
         stderr_text = "".join(stderr_lines)
         if stderr_text:
-            logger.debug("Claude stderr (first 500 chars): %s", stderr_text[:500])
+            logger.debug("OpenCode stderr (first 500 chars): %s", stderr_text[:500])
 
-        returncode = proc.returncode or 0
-        if timed_out and not parsed.result:
-            returncode = -1
+        if timed_out:
+            logger.warning("OpenCode invocation timed out — returning empty ParsedStream")
+            return ParsedStream()
 
-        if returncode != 0 and resume_session_id:
-            logger.warning(
-                "Claude exited non-zero (%d) with --resume %s — session may have expired",
-                returncode, resume_session_id,
-            )
+        # Generate a synthetic session ID for this run
+        run_session_id = str(uuid.uuid4())
+
+        # Compute elapsed duration from stdout collection (approximation)
+        parsed = parse_opencode_output(stdout_text, session_id=run_session_id)
 
         if parsed.result:
             logger.info(
-                "Claude finished: session=%s, cost=$%.4f, turns=%d",
-                parsed.session_id, parsed.result.cost_usd, parsed.result.num_turns,
+                "OpenCode finished: session=%s, turns=%d",
+                parsed.session_id, parsed.result.num_turns,
             )
 
         return parsed
@@ -684,7 +656,7 @@ class LoopDriver:
 
     def _dry_run_result(self) -> ParsedStream:
         """Return a simulated ParsedStream for dry runs."""
-        from ndjson_parser import ClaudeEvent, ClaudeResult
+        from ndjson_parser import ClaudeResult
 
         parsed = ParsedStream()
         parsed.session_id = f"dry-run-{int(time.time())}"
@@ -831,20 +803,20 @@ class LoopDriver:
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Automated Claude Code + Perplexity Research Loop"
+        description="Automated OpenCode + Perplexity Research Loop"
     )
     parser.add_argument("--project", default=".", help="Project directory path")
     parser.add_argument("--max-iterations", type=int, default=None, help="Max loop iterations")
-    parser.add_argument("--model", default=None, help="Claude model (sonnet, opus, haiku)")
+    parser.add_argument("--model", default=None, help="OpenCode model in provider/model format (e.g. anthropic/claude-sonnet-4-5)")
     parser.add_argument("--prompt", default="", help="Initial prompt for first iteration")
     parser.add_argument("--timeout", type=int, default=None, help="Per-iteration timeout in seconds")
     parser.add_argument("--max-budget", type=float, default=None, help="Max total budget in USD")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate without spawning Claude")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate without spawning OpenCode")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--json-log", action="store_true", help="Output structured JSON logs")
     parser.add_argument("--smoke-test", action="store_true", help="Safe single-iteration production validation")
     parser.add_argument("--no-stagnation-check", action="store_true", help="Disable diminishing returns detection")
-    parser.add_argument("--skip-preflight", action="store_true", help="Skip Claude CLI preflight check")
+    parser.add_argument("--skip-preflight", action="store_true", help="Skip OpenCode CLI preflight check")
     parser.add_argument("--config", default=None, help="Path to config.json")
     args = parser.parse_args()
 
@@ -880,7 +852,7 @@ def main() -> None:
     if args.max_iterations is not None:
         config.limits.max_iterations = args.max_iterations
     if args.model is not None:
-        config.claude.model = args.model
+        config.opencode.model = args.model
     if args.timeout is not None:
         config.limits.timeout_seconds = args.timeout
     if args.max_budget is not None:

@@ -1,7 +1,10 @@
-"""NDJSON parser for Claude Code --output-format stream-json events.
+"""NDJSON parser for Claude Code --output-format stream-json events and
+OpenCode -f json output.
 
 Ported from Claude Watcher v2.7.0 ndjson-parser.ts.
-Parses line-by-line NDJSON from Claude CLI stdout and extracts structured events.
+Parses line-by-line NDJSON from Claude CLI stdout and extracts structured
+events.  Also provides :func:`parse_opencode_output` to handle the single-
+JSON-object format produced by ``opencode -f json``.
 """
 
 from __future__ import annotations
@@ -175,3 +178,57 @@ def extract_result(events: list[ClaudeEvent]) -> Optional[ClaudeResult]:
                 is_error=event.raw.get("is_error", False),
             )
     return None
+
+
+def parse_opencode_output(
+    stdout: str,
+    session_id: str = "",
+    duration_ms: float = 0.0,
+) -> ParsedStream:
+    """Parse the output of ``opencode -f json`` into a :class:`ParsedStream`.
+
+    OpenCode non-interactive mode with ``-f json`` writes a single JSON object
+    to stdout::
+
+        {"response": "<assistant text>"}
+
+    Plain-text output (the default ``-f text`` mode) is also accepted — the
+    entire *stdout* string is treated as the assistant response.
+
+    Because OpenCode does not report per-run cost, turn counts, or tool events,
+    the returned :class:`ParsedStream` has zeroed-out cost/turn metadata and
+    empty ``tools_used`` / ``files_modified`` collections.  The caller is
+    responsible for supplying a ``session_id`` and ``duration_ms``.
+
+    Args:
+        stdout: Raw text captured from ``opencode`` stdout.
+        session_id: Identifier to assign to the returned stream.
+        duration_ms: Wall-clock duration of the subprocess invocation.
+
+    Returns:
+        A :class:`ParsedStream` populated from the OpenCode output.
+    """
+    parsed = ParsedStream()
+    content = stdout.strip()
+    if not content:
+        return parsed
+
+    # Try to parse as JSON (produced by -f json mode)
+    try:
+        data = json.loads(content)
+        response_text = data.get("response", "")
+    except json.JSONDecodeError:
+        # Fall back: treat the whole stdout as plain-text response
+        response_text = content
+
+    parsed.session_id = session_id
+    parsed.assistant_text = response_text
+    parsed.result = ClaudeResult(
+        session_id=session_id,
+        cost_usd=0.0,
+        duration_ms=duration_ms,
+        num_turns=1,
+        result_text=response_text,
+        is_error=False,
+    )
+    return parsed

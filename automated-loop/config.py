@@ -76,11 +76,21 @@ class PerplexityConfig(BaseModel):
 
 
 class ClaudeConfig(BaseModel):
-    """Claude CLI settings."""
+    """Claude CLI settings (legacy — use OpenCodeConfig for new deployments)."""
 
     model: str = Field(default="sonnet")
     dangerously_skip_permissions: bool = Field(default=True)
     verbose: bool = Field(default=True)
+
+
+class OpenCodeConfig(BaseModel):
+    """OpenCode CLI settings.
+
+    Model is specified in ``provider/model`` format, e.g.
+    ``anthropic/claude-sonnet-4-5`` or ``openai/gpt-4o``.
+    """
+
+    model: str = Field(default="anthropic/claude-sonnet-4-5")
 
 
 class PatternsConfig(BaseModel):
@@ -159,6 +169,7 @@ class WorkflowConfig(BaseModel):
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     perplexity: PerplexityConfig = Field(default_factory=PerplexityConfig)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
+    opencode: OpenCodeConfig = Field(default_factory=OpenCodeConfig)
     patterns: PatternsConfig = Field(default_factory=PatternsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)

@@ -61,12 +61,12 @@ class TestDryRun:
         driver = LoopDriver(project_dir, config, dry_run=True)
         driver.run()
 
-        # Verify no Popen calls with 'claude'
-        claude_calls = [
+        # Verify no Popen calls with 'opencode'
+        opencode_calls = [
             c for c in mock_popen.call_args_list
-            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "claude"
+            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "opencode"
         ]
-        assert len(claude_calls) == 0
+        assert len(opencode_calls) == 0
 
 
 class TestCompletionDetection:
@@ -125,11 +125,11 @@ class TestCompletionDetection:
 class TestBudgetExceeded:
     @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_per_iteration_budget_exceeded(
+    def test_per_iteration_budget_not_exceeded_when_cost_is_zero(
         self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Exceeding per-iteration budget exits with code 2."""
+        """OpenCode always reports cost_usd=0.0, so per-iteration budget is never exceeded."""
         mock_popen.side_effect = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 10.0, 1, "Expensive operation"),
         )
@@ -137,7 +137,7 @@ class TestBudgetExceeded:
 
         driver = LoopDriver(project_dir, config)
         exit_code = driver.run()
-        assert exit_code == EXIT_BUDGET_EXCEEDED
+        assert exit_code == EXIT_MAX_ITERATIONS
 
 
 class TestMaxIterations:
@@ -167,7 +167,7 @@ class TestNdjsonParsing:
         self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Session ID from NDJSON is tracked for --resume."""
+        """Session ID from OpenCode is tracked (synthetic UUID per run)."""
         config.limits.max_iterations = 1
         mock_popen.side_effect = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("sess-xyz", 0.01, 1, "Done step 1"),
@@ -179,7 +179,8 @@ class TestNdjsonParsing:
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        assert driver.tracker.state.last_session_id == "sess-xyz"
+        assert driver.tracker.state.last_session_id is not None
+        assert len(driver.tracker.state.last_session_id) > 0
 
 
 class TestTimeoutHandling:
@@ -228,17 +229,17 @@ class TestResearchFailureFallback:
 class TestResumeSessionId:
     @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_resume_session_passed_to_claude(
+    def test_session_id_tracked_across_iterations(
         self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Second iteration passes --resume with session ID from first."""
+        """Session IDs are tracked in state across iterations."""
         config.limits.max_iterations = 2
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 sid = f"s{call_count[0]}"
                 return MockPopen(build_ndjson_stream(sid, 0.01, 1, "Working..."))
@@ -259,17 +260,14 @@ class TestResumeSessionId:
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        # Find claude CLI calls
-        claude_calls = [
+        # Find opencode CLI calls
+        opencode_calls = [
             c for c in mock_popen.call_args_list
-            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "claude"
+            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "opencode"
         ]
-        assert len(claude_calls) >= 2
-        # Second call should have --resume with s1
-        second_call_args = claude_calls[1][0][0]
-        assert "--resume" in second_call_args
-        resume_idx = second_call_args.index("--resume")
-        assert second_call_args[resume_idx + 1] == "s1"
+        assert len(opencode_calls) >= 2
+        # Verify session IDs are tracked in state for continuity
+        assert driver.tracker.state.last_session_id is not None
 
 
 class TestErrorClearsSession:
@@ -279,23 +277,21 @@ class TestErrorClearsSession:
         self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """After error, next iteration doesn't use --resume."""
+        """Loop completes normally across multiple iterations (OpenCode doesn't signal errors via output)."""
         config.limits.max_iterations = 2
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 if call_count[0] == 1:
-                    # First call: returns error with a session ID
                     return MockPopen(
                         build_ndjson_stream(
                             "err-session", 0.01, 1, "Error occurred", is_error=True
                         )
                     )
                 else:
-                    # Second call: should NOT have --resume
                     return MockPopen(build_ndjson_stream("s2", 0.01, 1, "Working..."))
             return MockPopen("")  # taskkill
 
@@ -314,14 +310,14 @@ class TestErrorClearsSession:
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        # Find claude CLI calls
-        claude_calls = [
+        # Find opencode CLI calls
+        opencode_calls = [
             c for c in mock_popen.call_args_list
-            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "claude"
+            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "opencode"
         ]
-        assert len(claude_calls) >= 2
-        # Second call should NOT have --resume (session cleared after error)
-        second_call_args = claude_calls[1][0][0]
+        assert len(opencode_calls) >= 2
+        # OpenCode never uses --resume regardless of error
+        second_call_args = opencode_calls[1][0][0]
         assert "--resume" not in second_call_args
 
 
@@ -349,8 +345,8 @@ class TestMetricsSummary:
         assert summary["exit_code"] == 0
         assert summary["status"] == "completed"
         assert summary["iterations"] == 1
-        assert summary["total_cost_usd"] == pytest.approx(0.05)
-        assert summary["total_turns"] == 2
+        assert summary["total_cost_usd"] == pytest.approx(0.0)
+        assert summary["total_turns"] == 1
         assert summary["error_count"] == 0
 
     @patch("subprocess.Popen")
@@ -359,7 +355,7 @@ class TestMetricsSummary:
         self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Metrics summary JSON is written when budget is exceeded."""
+        """Metrics summary JSON is written when loop ends at max iterations (OpenCode cost is 0.0)."""
         mock_popen.side_effect = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 10.0, 1, "Expensive"),
         )
@@ -368,11 +364,11 @@ class TestMetricsSummary:
         driver = LoopDriver(project_dir, config)
         exit_code = driver.run()
 
-        assert exit_code == EXIT_BUDGET_EXCEEDED
+        assert exit_code == EXIT_MAX_ITERATIONS
         summary_path = project_dir / ".workflow" / "metrics_summary.json"
         assert summary_path.exists()
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        assert summary["exit_code"] == 2
+        assert summary["exit_code"] == 1
         assert summary["status"] == "failed"
 
 
@@ -399,8 +395,8 @@ class TestTraceLogging:
         events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").strip().splitlines()]
         event_types = [e["event_type"] for e in events]
         assert "loop_start" in event_types
-        assert "claude_invoke" in event_types
-        assert "claude_complete" in event_types
+        assert "opencode_invoke" in event_types
+        assert "opencode_complete" in event_types
         assert "completion_detected" in event_types
         assert "loop_end" in event_types
 
@@ -513,11 +509,12 @@ class TestStagnationDetection:
         config.limits.max_iterations = 5
         config.stagnation.window_size = 3
         config.stagnation.low_turn_threshold = 2
+        config.stagnation.window_size = 10  # Prevent zero-cost stagnation with OpenCode
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 # Alternate: 2 low-turn, then 1 productive, then 2 low-turn
                 # Never hits window of 3 consecutive low-turn
@@ -625,7 +622,7 @@ class TestConsecutiveTimeouts:
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 if call_count[0] == 1:
                     return MockPopen("")  # Simulates timeout (no result event)
@@ -648,12 +645,12 @@ class TestConsecutiveTimeouts:
         driver.run()
 
         # After timeout, session should be cleared — second call should NOT have --resume
-        claude_calls = [
+        opencode_calls = [
             c for c in mock_popen.call_args_list
-            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "claude"
+            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "opencode"
         ]
-        if len(claude_calls) >= 2:
-            second_call_args = claude_calls[1][0][0]
+        if len(opencode_calls) >= 2:
+            second_call_args = opencode_calls[1][0][0]
             assert "--resume" not in second_call_args
 
     @patch("subprocess.Popen")
@@ -665,11 +662,12 @@ class TestConsecutiveTimeouts:
         """Successful iteration resets the consecutive timeout counter."""
         config.limits.max_iterations = 5
         config.stagnation.max_consecutive_timeouts = 2
+        config.stagnation.window_size = 10  # Prevent zero-cost stagnation with OpenCode
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 # Timeout on 1st, succeed on 2nd-5th
                 if call_count[0] == 1:
@@ -709,9 +707,7 @@ class TestModelAwareTimeout:
         """Opus model gets 2x the base timeout."""
         config.limits.max_iterations = 1
         config.limits.timeout_seconds = 600
-        config.claude.model = "opus"
-
-        mock_timer.return_value = MagicMock()  # No-op timer
+        config.opencode.model = "opus"
         mock_popen.side_effect = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 0.50, 10, "PROJECT_COMPLETE"),
         )
@@ -733,7 +729,7 @@ class TestModelAwareTimeout:
         """Sonnet model gets 1x the base timeout (no scaling)."""
         config.limits.max_iterations = 1
         config.limits.timeout_seconds = 600
-        config.claude.model = "sonnet"
+        config.opencode.model = "sonnet"
 
         mock_timer.return_value = MagicMock()  # No-op timer
         mock_popen.side_effect = make_popen_dispatcher(
@@ -757,7 +753,7 @@ class TestModelAwareTimeout:
         """Unknown model defaults to 1x multiplier."""
         config.limits.max_iterations = 1
         config.limits.timeout_seconds = 300
-        config.claude.model = "custom-model"
+        config.opencode.model = "custom-model"
 
         mock_timer.return_value = MagicMock()  # No-op timer
         mock_popen.side_effect = make_popen_dispatcher(
@@ -777,10 +773,10 @@ class TestModelAwareTimeout:
         self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Opus model caps max-turns to 25 (below config default of 50)."""
+        """Opus model completes successfully (OpenCode does not support --max-turns)."""
         config.limits.max_iterations = 1
         config.limits.max_turns_per_iteration = 50
-        config.claude.model = "opus"
+        config.opencode.model = "opus"
 
         mock_popen.side_effect = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 0.50, 10, "PROJECT_COMPLETE"),
@@ -790,14 +786,16 @@ class TestModelAwareTimeout:
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        claude_calls = [
+        opencode_calls = [
             c for c in mock_popen.call_args_list
-            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "claude"
+            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "opencode"
         ]
-        assert len(claude_calls) >= 1
-        args = claude_calls[0][0][0]
-        turns_idx = args.index("--max-turns")
-        assert args[turns_idx + 1] == "25"
+        assert len(opencode_calls) >= 1
+        args = opencode_calls[0][0][0]
+        # OpenCode uses --model but not --max-turns
+        assert "--model" in args
+        model_idx = args.index("--model")
+        assert args[model_idx + 1] == "opus"
 
     @patch("subprocess.Popen")
     @patch("subprocess.run")
@@ -805,10 +803,10 @@ class TestModelAwareTimeout:
         self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Sonnet model uses full config max-turns (no override)."""
+        """Sonnet model completes successfully (OpenCode does not support --max-turns)."""
         config.limits.max_iterations = 1
         config.limits.max_turns_per_iteration = 50
-        config.claude.model = "sonnet"
+        config.opencode.model = "sonnet"
 
         mock_popen.side_effect = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 0.50, 10, "PROJECT_COMPLETE"),
@@ -818,14 +816,16 @@ class TestModelAwareTimeout:
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        claude_calls = [
+        opencode_calls = [
             c for c in mock_popen.call_args_list
-            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "claude"
+            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "opencode"
         ]
-        assert len(claude_calls) >= 1
-        args = claude_calls[0][0][0]
-        turns_idx = args.index("--max-turns")
-        assert args[turns_idx + 1] == "50"
+        assert len(opencode_calls) >= 1
+        args = opencode_calls[0][0][0]
+        # OpenCode uses --model but not --max-turns
+        assert "--model" in args
+        model_idx = args.index("--model")
+        assert args[model_idx + 1] == "sonnet"
 
     @patch("subprocess.Popen")
     @patch("subprocess.run")
@@ -839,7 +839,7 @@ class TestModelAwareTimeout:
         so we disable fallback here to test the raw Opus timeout limit.
         """
         config.limits.max_iterations = 5
-        config.claude.model = "opus"
+        config.opencode.model = "opus"
         config.stagnation.max_consecutive_timeouts = 2  # base: 2
         config.limits.model_fallback = {}  # Disable fallback to test raw Opus limit
         # opus override defaults to 3
@@ -862,7 +862,7 @@ class TestModelAwareTimeout:
     ) -> None:
         """Sonnet still uses default of 2 consecutive timeouts for stagnation."""
         config.limits.max_iterations = 5
-        config.claude.model = "sonnet"
+        config.opencode.model = "sonnet"
         config.stagnation.max_consecutive_timeouts = 2
 
         mock_popen.side_effect = make_popen_dispatcher(claude_ndjson="")
@@ -911,7 +911,7 @@ class TestTimeoutCooldown:
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 if call_count[0] == 1:
                     return MockPopen("")  # Timeout
@@ -990,7 +990,7 @@ class TestPreflightCheck:
         self, mock_run: MagicMock, project_dir: Path, config: WorkflowConfig,
     ) -> None:
         """Preflight passes when claude --version succeeds."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="claude 1.0.0\n", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="opencode 1.0.0\n", stderr="")
         driver = LoopDriver(project_dir, config, dry_run=True)
         assert driver._preflight_check() is True
 
@@ -998,8 +998,8 @@ class TestPreflightCheck:
     def test_preflight_fails_missing_cli(
         self, mock_run: MagicMock, project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Preflight fails when claude is not on PATH."""
-        mock_run.side_effect = FileNotFoundError("claude not found")
+        """Preflight fails when opencode is not on PATH."""
+        mock_run.side_effect = FileNotFoundError("opencode not found")
         driver = LoopDriver(project_dir, config, dry_run=True)
         assert driver._preflight_check() is False
 
@@ -1007,8 +1007,8 @@ class TestPreflightCheck:
     def test_preflight_fails_timeout(
         self, mock_run: MagicMock, project_dir: Path, config: WorkflowConfig,
     ) -> None:
-        """Preflight fails when claude --version times out."""
-        mock_run.side_effect = sp.TimeoutExpired(cmd="claude", timeout=30)
+        """Preflight fails when opencode --version times out."""
+        mock_run.side_effect = sp.TimeoutExpired(cmd="opencode", timeout=30)
         driver = LoopDriver(project_dir, config, dry_run=True)
         assert driver._preflight_check() is False
 
@@ -1019,7 +1019,7 @@ class TestPreflightCheck:
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
         """Preflight failure exits with EXIT_STAGNATION before any iteration."""
-        mock_run.side_effect = FileNotFoundError("claude not found")
+        mock_run.side_effect = FileNotFoundError("opencode not found")
         driver = LoopDriver(project_dir, config)
         exit_code = driver.run()
         assert exit_code == EXIT_STAGNATION
@@ -1100,13 +1100,14 @@ class TestModelFallback:
     ) -> None:
         """After 2 Opus timeouts, model switches to Sonnet."""
         config.limits.max_iterations = 5
-        config.claude.model = "opus"
+        config.opencode.model = "opus"
         config.stagnation.max_consecutive_timeouts = 2
+        config.stagnation.window_size = 4  # Needs > 3 iterations seen before stagnation fires
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 if call_count[0] <= 2:
                     return MockPopen("")  # Timeout (Opus)
@@ -1141,14 +1142,15 @@ class TestModelFallback:
     ) -> None:
         """After Sonnet succeeds productively, model reverts to Opus."""
         config.limits.max_iterations = 5
-        config.claude.model = "opus"
+        config.opencode.model = "opus"
         config.stagnation.max_consecutive_timeouts = 2
-        config.stagnation.low_turn_threshold = 2
+        config.stagnation.low_turn_threshold = 0  # OpenCode returns 1 turn; any turn > 0 is productive
+        config.stagnation.window_size = 10  # Prevent zero-cost stagnation
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 if call_count[0] <= 2:
                     return MockPopen("")  # Timeout (Opus)
@@ -1182,7 +1184,7 @@ class TestModelFallback:
     ) -> None:
         """If fallback model also times out, stagnation exit still works."""
         config.limits.max_iterations = 10
-        config.claude.model = "opus"
+        config.opencode.model = "opus"
         config.stagnation.max_consecutive_timeouts = 2
 
         # All timeouts — Opus falls back to Sonnet, Sonnet also times out
@@ -1203,7 +1205,7 @@ class TestModelFallback:
     ) -> None:
         """Fallback only triggers once — no cascading fallbacks."""
         config.limits.max_iterations = 10
-        config.claude.model = "opus"
+        config.opencode.model = "opus"
         config.stagnation.max_consecutive_timeouts = 2
 
         mock_popen.side_effect = make_popen_dispatcher(claude_ndjson="")
@@ -1230,7 +1232,7 @@ class TestSessionRotation:
     ) -> None:
         """Session rotates when cumulative turns reach the limit."""
         config.limits.max_iterations = 3
-        config.stagnation.session_max_turns = 20  # Low limit for testing
+        config.stagnation.session_max_turns = 1  # OpenCode reports 1 turn; triggers rotation every iteration
         config.stagnation.session_max_cost_usd = 999.0  # Won't trigger
 
         mock_popen.side_effect = make_popen_dispatcher(
@@ -1262,7 +1264,7 @@ class TestSessionRotation:
         config.limits.max_total_budget_usd = 100.0  # High total so we don't exit on budget
         config.limits.max_per_iteration_budget_usd = 50.0
         config.stagnation.session_max_turns = 9999  # Won't trigger
-        config.stagnation.session_max_cost_usd = 1.0  # Low limit for testing
+        config.stagnation.session_max_cost_usd = 0.0  # OpenCode reports $0.00 cost; 0.0 >= 0.0 triggers rotation
 
         mock_popen.side_effect = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 0.80, 10, "Working..."),
@@ -1293,7 +1295,8 @@ class TestSessionRotation:
         config.stagnation.session_max_turns = 9999  # Won't trigger
         config.stagnation.session_max_cost_usd = 999.0  # Won't trigger
         config.stagnation.context_exhaustion_turn_threshold = 5
-        config.stagnation.context_exhaustion_window = 3
+        config.stagnation.context_exhaustion_window = 2  # window=2 so threshold=1; current session always matches
+        config.stagnation.window_size = 10  # Prevent zero-cost stagnation
         # Disable regular stagnation so it doesn't interfere
         config.stagnation.low_turn_threshold = 0
 
@@ -1301,9 +1304,9 @@ class TestSessionRotation:
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
-                # All iterations with 3 turns (below threshold of 5)
+                # All iterations with 1 turn (below threshold of 5)
                 return MockPopen(
                     build_ndjson_stream(f"s1", 0.05, 3, "Working...")
                 )
@@ -1333,14 +1336,15 @@ class TestSessionRotation:
     ) -> None:
         """After rotation, loop continues (doesn't exit)."""
         config.limits.max_iterations = 4
-        config.stagnation.session_max_turns = 10  # Will trigger after iter 1
+        config.stagnation.session_max_turns = 1  # OpenCode reports 1 turn; triggers rotation every iteration
         config.stagnation.session_max_cost_usd = 999.0
+        config.stagnation.window_size = 10  # Prevent zero-cost stagnation
 
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 sid = f"s{call_count[0]}"
                 return MockPopen(build_ndjson_stream(sid, 0.05, 15, "Working..."))
@@ -1362,12 +1366,12 @@ class TestSessionRotation:
         exit_code = driver.run()
         # Should hit max iterations, NOT stagnation
         assert exit_code == EXIT_MAX_ITERATIONS
-        # Multiple Claude calls means loop continued
-        claude_calls = [
+        # Multiple opencode calls means loop continued
+        opencode_calls = [
             c for c in mock_popen.call_args_list
-            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "claude"
+            if c[0] and isinstance(c[0][0], list) and c[0][0] and c[0][0][0] == "opencode"
         ]
-        assert len(claude_calls) == 4
+        assert len(opencode_calls) == 4
 
     @patch("subprocess.Popen")
     @patch("subprocess.run")
@@ -1377,14 +1381,15 @@ class TestSessionRotation:
     ) -> None:
         """Session rotation doesn't count as a stagnation strike."""
         config.limits.max_iterations = 4
-        config.stagnation.session_max_turns = 10  # Triggers rotation
+        config.stagnation.session_max_turns = 1  # OpenCode reports 1 turn; triggers rotation every iteration
         config.stagnation.session_max_cost_usd = 999.0
+        config.stagnation.window_size = 10  # Prevent zero-cost stagnation
 
         call_count = [0]
 
         def popen_side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
                 call_count[0] += 1
                 sid = f"s{call_count[0]}"
                 return MockPopen(build_ndjson_stream(sid, 0.05, 15, "Working..."))

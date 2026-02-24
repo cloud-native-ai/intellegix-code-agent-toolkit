@@ -1,7 +1,7 @@
-"""Shared test helpers for the automated Claude loop test suite.
+"""Shared test helpers for the automated OpenCode loop test suite.
 
 Fixtures are in conftest.py. This module contains non-fixture helpers
-(mock builders, NDJSON stream builders) used across multiple test files.
+(mock builders, output stream builders) used across multiple test files.
 """
 
 import io
@@ -9,8 +9,29 @@ import json
 from unittest.mock import MagicMock
 
 
-# --- NDJSON stream builders ---
+# --- OpenCode output builders ---
 
+def build_opencode_output(
+    result_text: str,
+    is_error: bool = False,
+) -> str:
+    """Build a realistic output string matching OpenCode -f json format.
+
+    ``opencode -p <prompt> -f json`` outputs a single JSON object::
+
+        {"response": "<assistant text>"}
+
+    ``is_error`` is accepted for API compatibility but has no effect on the
+    output format, since OpenCode does not distinguish error responses in its
+    JSON output.
+    """
+    return json.dumps({"response": result_text})
+
+
+# Keep a backward-compatible alias so that existing test call-sites can be
+# migrated incrementally.  The *session_id*, *cost*, and *duration_ms*
+# arguments are silently ignored because OpenCode does not include them in its
+# output.
 def build_ndjson_stream(
     session_id: str,
     cost: float,
@@ -19,28 +40,14 @@ def build_ndjson_stream(
     is_error: bool = False,
     duration_ms: int = 10000,
 ) -> str:
-    """Build a realistic NDJSON stream string matching Claude CLI output format."""
-    lines = [
-        json.dumps({"type": "init", "session_id": session_id}),
-        json.dumps({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "text", "text": result_text}],
-            },
-            "session_id": session_id,
-        }),
-        json.dumps({
-            "type": "result",
-            "session_id": session_id,
-            "total_cost_usd": cost,
-            "total_duration_ms": duration_ms,
-            "num_turns": turns,
-            "result": result_text,
-            "is_error": is_error,
-        }),
-    ]
-    return "\n".join(lines)
+    """Backward-compatible alias for :func:`build_opencode_output`.
+
+    .. deprecated::
+        Use :func:`build_opencode_output` directly.  The *session_id*, *cost*,
+        *turns*, and *duration_ms* parameters are no longer reflected in the
+        output because OpenCode uses a simpler ``{"response": "..."}`` format.
+    """
+    return build_opencode_output(result_text, is_error=is_error)
 
 
 # --- Subprocess mock helpers ---
@@ -78,40 +85,48 @@ def mock_git_log_result() -> MagicMock:
 
 
 def make_subprocess_dispatcher(
-    claude_result=None,
-    claude_side_effect=None,
+    opencode_result=None,
+    opencode_side_effect=None,
     research_result=None,
     research_side_effect=None,
+    # Backward-compatible aliases
+    claude_result=None,
+    claude_side_effect=None,
 ):
     """Create a subprocess.run mock that dispatches based on command.
 
     - git commands -> mock_git_log_result()
-    - claude commands -> claude_result or raise claude_side_effect
+    - opencode commands -> opencode_result or raise opencode_side_effect
     - council_browser commands -> research_result or raise research_side_effect
+
+    The *claude_result* / *claude_side_effect* kwargs are accepted as
+    backward-compatible aliases for *opencode_result* / *opencode_side_effect*.
     """
+    # Allow old call-sites that still pass claude_result / claude_side_effect
+    if opencode_result is None and claude_result is not None:
+        opencode_result = claude_result
+    if opencode_side_effect is None and claude_side_effect is not None:
+        opencode_side_effect = claude_side_effect
+
     def side_effect(*args, **kwargs):
         cmd = args[0] if args else kwargs.get("args", [])
         if isinstance(cmd, list) and cmd:
             if cmd[0] == "git":
                 return mock_git_log_result()
-            if cmd[0] == "claude":
-                # Handle preflight check (claude --version)
+            if cmd[0] == "opencode":
+                # Handle preflight check (opencode --version)
                 if len(cmd) >= 2 and cmd[1] == "--version":
-                    return MagicMock(returncode=0, stdout="claude 1.0.0-test\n", stderr="")
-                if claude_side_effect is not None:
-                    raise claude_side_effect
-                return claude_result
-            if len(cmd) > 1 and "claude" in str(cmd[1]):
-                if claude_side_effect is not None:
-                    raise claude_side_effect
-                return claude_result
+                    return MagicMock(returncode=0, stdout="opencode 1.0.0-test\n", stderr="")
+                if opencode_side_effect is not None:
+                    raise opencode_side_effect
+                return opencode_result
             if "council_browser" in str(cmd):
                 if research_side_effect is not None:
                     raise research_side_effect
                 return research_result
         # Default fallback
-        if claude_result is not None:
-            return claude_result
+        if opencode_result is not None:
+            return opencode_result
         return MagicMock(returncode=0, stdout="", stderr="")
 
     return side_effect
@@ -134,16 +149,16 @@ def make_research_dispatcher(playwright_result=None, playwright_side_effect=None
     return side_effect
 
 
-# --- Popen mock for streaming NDJSON (replaces subprocess.run for Claude CLI) ---
+# --- Popen mock for capturing OpenCode output ---
 
 class MockPopen:
-    """Mock subprocess.Popen that yields NDJSON lines from stdout.
+    """Mock subprocess.Popen that yields output lines from stdout.
 
-    Used for testing _invoke_claude which reads stdout line-by-line.
+    Used for testing _invoke_opencode which reads stdout until EOF.
     """
 
-    def __init__(self, ndjson_stream: str, returncode: int = 0) -> None:
-        self.stdout = io.StringIO(ndjson_stream)
+    def __init__(self, output_stream: str, returncode: int = 0) -> None:
+        self.stdout = io.StringIO(output_stream)
         self.stderr = io.StringIO("")
         self.returncode = returncode
         self.pid = 99999
@@ -156,30 +171,45 @@ class MockPopen:
 
 
 def make_popen_factory(
-    ndjson_stream: str, returncode: int = 0
+    output_stream: str, returncode: int = 0
 ):
     """Create a factory for subprocess.Popen mock (returns MockPopen)."""
     def factory(*args, **kwargs):
-        return MockPopen(ndjson_stream, returncode)
+        return MockPopen(output_stream, returncode)
     return factory
 
 
 def make_popen_dispatcher(
+    opencode_output: str | None = None,
+    opencode_returncode: int = 0,
+    opencode_side_effect: Exception | None = None,
+    # Backward-compatible aliases
     claude_ndjson: str | None = None,
-    claude_returncode: int = 0,
+    claude_returncode: int | None = None,
     claude_side_effect: Exception | None = None,
 ):
     """Create a side_effect for subprocess.Popen mock.
 
-    Claude commands return MockPopen with NDJSON stream.
-    Non-Claude Popen calls (e.g. taskkill) return a no-op MockPopen.
+    ``opencode`` commands return MockPopen with the given output stream.
+    Non-opencode Popen calls (e.g. taskkill) return a no-op MockPopen.
+
+    The *claude_ndjson* / *claude_returncode* / *claude_side_effect* kwargs are
+    accepted as backward-compatible aliases.
     """
+    # Allow old call-sites that still use claude_* kwargs
+    if opencode_output is None and claude_ndjson is not None:
+        opencode_output = claude_ndjson
+    if claude_returncode is not None:
+        opencode_returncode = claude_returncode
+    if opencode_side_effect is None and claude_side_effect is not None:
+        opencode_side_effect = claude_side_effect
+
     def factory(*args, **kwargs):
         cmd = args[0] if args else kwargs.get("args", [])
-        if isinstance(cmd, list) and cmd and cmd[0] == "claude":
-            if claude_side_effect is not None:
-                raise claude_side_effect
-            return MockPopen(claude_ndjson or "", claude_returncode)
+        if isinstance(cmd, list) and cmd and cmd[0] == "opencode":
+            if opencode_side_effect is not None:
+                raise opencode_side_effect
+            return MockPopen(opencode_output or "", opencode_returncode)
         # taskkill or other subprocess.Popen calls
         return MockPopen("", 0)
     return factory

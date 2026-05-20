@@ -976,8 +976,18 @@ def main() -> None:
         help="Auto-generate project context from git/CLAUDE.md/MEMORY.md")
     parser.add_argument("--invocation-id",
         help="Per-invocation UUID for concurrent query isolation (cache file naming)")
+    parser.add_argument("--prompt-stdin", action="store_true",
+        help="Read the query from stdin instead of the positional argument. Used by "
+             "extended_research_runner.py to avoid Windows lpCommandLine 32K limit.")
 
     args = parser.parse_args()
+
+    if args.prompt_stdin:
+        if args.query:
+            parser.error("--prompt-stdin is mutually exclusive with positional query")
+        args.query = sys.stdin.read()
+        if not args.query.strip():
+            parser.error("--prompt-stdin set but stdin was empty")
 
     # Read mode — no network calls
     if args.read:

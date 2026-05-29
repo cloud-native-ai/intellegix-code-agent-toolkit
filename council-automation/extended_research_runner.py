@@ -57,7 +57,58 @@ except ImportError:
 COUNCIL_AUTOMATION_DIR = Path(__file__).parent
 COUNCIL_QUERY_SCRIPT = COUNCIL_AUTOMATION_DIR / "council_query.py"
 
-ARTIFACT_TEXT_TOKEN_CAP = 8000          # max tokens for {{ARTIFACT_TEXT}} injection
+# Phase 1 instrumentation (2026-05-29 empirical-reassessment plan).
+# Per-pass JSONL emitted into {WORKDIR}/instrumentation.jsonl AND into the
+# global rolling log at ~/.claude/council-cache/instrumentation.jsonl. Global
+# log is capped at 10 MB with tail-truncation to 8 MB at write time; workdir
+# log is per-run and never explicitly capped.
+INSTRUMENTATION_GLOBAL_LOG = (
+    Path.home() / ".claude" / "council-cache" / "instrumentation.jsonl"
+)
+INSTRUMENTATION_CAP_BYTES = 10 * 1024 * 1024
+
+
+def _append_instrumentation_jsonl(
+    path: Path, record: dict, cap_bytes: int = INSTRUMENTATION_CAP_BYTES
+) -> None:
+    """Append a JSONL record with size-cap enforcement at write time.
+
+    Tail-truncate to 8 MB if file > cap_bytes. Recent data is more valuable
+    than oldest. Drops any partial first line after truncation. Never raises:
+    instrumentation must not block runner execution.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > cap_bytes:
+            data = path.read_bytes()[-(8 * 1024 * 1024):]
+            first_nl = data.find(b"\n")
+            if first_nl > 0:
+                data = data[first_nl + 1:]
+            path.write_bytes(data)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _emit_pass_instrumentation(workdir: Path, record: dict) -> None:
+    """Emit one Phase 1 per-pass instrumentation record to both sinks."""
+    try:
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **record}
+    except Exception:
+        pass
+    _append_instrumentation_jsonl(workdir / "instrumentation.jsonl", record, cap_bytes=10**12)
+    _append_instrumentation_jsonl(INSTRUMENTATION_GLOBAL_LOG, record)
+
+
+# Lowered 2026-05-27 from 8000 -> 3500 (~14 KB chars). Then revised 2026-05-29
+# to 5000 (~20 KB) per /extended-research audit verdict STRUCTURAL-UNRESOLVABLE:
+# the 3500 value was extrapolated from ONE 65 KB failure and likely under-utilized
+# Perplexity's true capacity. 5000 sits AT the documented ~20 KB browser-UI cliff
+# but Phase 1 instrumentation (instrumentation.jsonl) measures render-miss events
+# per run, enabling future data-driven adjustment.
+# INTERIM PENDING PHASE 4 CALIBRATION — do not treat as final value.
+ARTIFACT_TEXT_TOKEN_CAP = 5000          # max tokens for {{ARTIFACT_TEXT}} injection
 FRESH_OBSERVER_SUMMARY_CAP = 2000       # Claude-generated summary cap
 FRESH_OBSERVER_TOTAL_CAP = 4000         # summary + finding titles list combined
 FRESH_OBSERVER_SCHEDULE = (8, 14, 20)   # pass numbers (and every 6 after)
@@ -73,6 +124,18 @@ CONVERGENCE_ZERO_FINDING_PASSES = 3
 # bot-detection lockout, runner-side parser bugs, and other "garbage in for the whole
 # run" failure modes. Caller can salvage via salvaged-responses.md.
 PARSE_FAIL_STREAK_THRESHOLD = 3
+
+# PATCH 2026-05-20 (Perplexity audit Pattern A mitigation): a heavy 115s+
+# research call from one IP+cookie session degrades the NEXT call within
+# ~60s — Perplexity's backend throttles synthesis, page loads but
+# div.prose.max-w-none never populates → 0-byte raw response. Inserting a
+# cooldown between sequential passes mitigates this until the deferred
+# single-Playwright-context refactor lands. 0 disables the cooldown.
+# Env var: PERPLEXITY_INTER_PASS_SLEEP_S (default 30s).
+try:
+    INTER_PASS_SLEEP_S = max(0.0, float(os.environ.get("PERPLEXITY_INTER_PASS_SLEEP_S", "30")))
+except ValueError:
+    INTER_PASS_SLEEP_S = 30.0
 # Circuit breaker — if K consecutive passes return status=SKIPPED-NETWORK, abort.
 # Catches subprocess.run failures (TimeoutExpired, OSError, non-zero exit from
 # council_query.py — Cloudflare lockout, expired session, persistent network drop,
@@ -338,6 +401,150 @@ def _walk_balanced_object(text: str, start: int) -> int | None:
     return None
 
 
+def _extract_longest_valid_json_prefix(text: str) -> dict | None:
+    """Return the longest balanced JSON object prefix that parses cleanly.
+
+    Used when Perplexity truncates a JSON response mid-stream (max_tokens or
+    render-stall): we can often salvage the first N keys before the cut. Walks
+    the string tracking brace depth + in-string state, finds the first balanced
+    `{...}` slice, attempts json.loads. Returns None if no balanced prefix
+    parses. 2026-05-27 Tier 3 free-recovery pass.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    depth = 0
+    in_string = False
+    escape_next = False
+    last_balanced = -1
+    for i, ch in enumerate(s):
+        if escape_next:
+            escape_next = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape_next = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                last_balanced = i + 1
+                break
+    if last_balanced < 0:
+        return None
+    try:
+        return json.loads(s[:last_balanced])
+    except Exception:
+        return None
+
+
+# Phase 2 parser provisions (2026-05-29). Address wrapper-style responses where
+# the same JSON appears twice — once truncated in `## Summary`, once complete in
+# `## Detailed Analysis` — by anchoring search after the last Detailed Analysis
+# header and selecting the largest brace-balanced span.
+KNOWN_PASS_TYPES = frozenset([
+    "DECOMPOSE", "CRITIQUE", "ADVERSARIAL", "OPTIONS_SWEEP", "TARGETED_PROBE",
+    "BLUEPRINT", "GUIDANCE", "EXPLORATORY_BRANCH", "POSTMORTEM",
+    "FRESH_OBSERVER", "INTEGRATION", "FINAL_VERDICT",
+])
+REQUIRED_TOP_LEVEL_KEYS = frozenset([
+    "pass_type", "findings", "contradictions", "options", "verdict_hint",
+    "raw_evidence_summary",
+])
+
+
+def _extract_after_detailed_analysis(text: str) -> str:
+    """Return text after the last `## Detailed Analysis` header if present.
+
+    Perplexity often wraps replies as `## Summary` (truncated preview) +
+    `## Detailed Analysis` (complete). Anchoring search after the LAST
+    Detailed Analysis header drops the truncated Summary copy from
+    consideration. Falls back to returning text unchanged if header absent.
+    """
+    if not text:
+        return text
+    idx = text.rfind("## Detailed Analysis")
+    if idx < 0:
+        return text
+    return text[idx:]
+
+
+def _is_complete_finding(f: Any) -> bool:
+    """Reject partially-parsed final-array-element fragments.
+
+    A finding is complete iff it's a dict with `id` key AND >=1 other key.
+    Mid-array truncation can leave the last finding as `{"id": "F009"` which
+    parses to a dict-without-id-key in some json-repair scenarios.
+    """
+    return isinstance(f, dict) and "id" in f and len(f) >= 2
+
+
+def _filter_complete_findings(parsed: dict) -> dict:
+    """Drop incomplete findings from parsed['findings'] in place."""
+    findings = parsed.get("findings")
+    if isinstance(findings, list):
+        parsed["findings"] = [f for f in findings if _is_complete_finding(f)]
+    return parsed
+
+
+def _is_valid_shape(d: Any) -> bool:
+    """Stricter shape gate (2026-05-29). Rejects narrow sub-objects.
+
+    Requires:
+      - pass_type is a string AND its value is in KNOWN_PASS_TYPES
+      - findings is a list (empty list OK)
+      - >=3 of REQUIRED_TOP_LEVEL_KEYS present in dict
+    """
+    if not isinstance(d, dict):
+        return False
+    if not isinstance(d.get("pass_type"), str):
+        return False
+    if d["pass_type"] not in KNOWN_PASS_TYPES:
+        return False
+    if not isinstance(d.get("findings"), list):
+        return False
+    if len(d.keys() & REQUIRED_TOP_LEVEL_KEYS) < 3:
+        return False
+    return True
+
+
+def _largest_balanced_json_dict(text: str, anchor_pattern: str) -> dict | None:
+    """Walk ALL anchor matches; return the LONGEST brace-balanced dict that
+    parses cleanly AND passes the shape gate.
+
+    Truncated copies close their brace early, producing shorter spans;
+    complete copies span further. The shape gate (_is_valid_shape) rejects
+    narrow sub-objects that happen to be the longest balanced sub-tree.
+    """
+    matches = list(re.finditer(anchor_pattern, text))
+    best_dict: dict | None = None
+    best_len = 0
+    for m in matches:
+        start = m.start()
+        end = _walk_balanced_object(text, start)
+        if end is None:
+            continue
+        if end - start <= best_len:
+            continue
+        candidate = text[start:end]
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not _is_valid_shape(obj):
+            continue
+        best_dict = obj
+        best_len = end - start
+    return best_dict
+
+
 def extract_json(text: str) -> dict | None:
     """Extract the response JSON from an LLM/Perplexity reply.
 
@@ -392,6 +599,19 @@ def extract_json(text: str) -> dict | None:
     if qmatches:
         body = body[qmatches[-1].end():]
     body = re.sub(r"\n-{3,}\s*\nCache:.*\Z", "", body, flags=re.DOTALL)
+
+    # 3.5. Phase 2 (2026-05-29 reassessment) — wrapper-aware extraction.
+    # Perplexity often emits the same JSON twice: a truncated copy in `## Summary`
+    # and a complete copy in `## Detailed Analysis`. Anchor search after the LAST
+    # Detailed Analysis header to drop the Summary copy, then pick the LARGEST
+    # brace-balanced span (truncated copies close their brace early), with the
+    # shape gate rejecting narrow sub-objects that happen to be the longest
+    # balanced sub-tree. Filter incomplete findings (final-element truncation)
+    # before returning. Free attempt — falls through to existing stages on miss.
+    body_scoped = _extract_after_detailed_analysis(body)
+    wrapper_result = _largest_balanced_json_dict(body_scoped, r'\{\s*"pass_type"')
+    if wrapper_result is not None:
+        return _filter_complete_findings(wrapper_result)
 
     # 4. Anchored extraction — locate the response's signature opener.
     # Try in order of specificity. The response ALWAYS starts with `{"pass_type"`
@@ -460,6 +680,73 @@ def validate_response(obj: dict | None) -> tuple[bool, str | None]:
         return True, None
     except jsonschema.ValidationError as e:
         return False, f"schema validation failed: {e.message} at {list(e.absolute_path)}"
+
+
+def _defensive_inject_required(parsed: dict | None, pass_type: str) -> dict | None:
+    """Inject sane defaults for top-level required fields the model may have dropped.
+
+    Per 2026-05-22 audit: Perplexity sometimes omits `pass_type` and other
+    required top-level fields (or returns malformed sub-items in `findings` /
+    `options` arrays). Schema validation rejects, the runner retries once,
+    same drop happens, and the PARSE_FAIL streak triggers ABORTED termination
+    even though the response actually contained useful content.
+
+    The defensive fix:
+      - `pass_type` is always known from context (passed to run_pass); inject it.
+      - Missing arrays default to empty (`findings`, `contradictions`, `options`).
+      - Missing strings get short sentinel values (`verdict_hint`,
+        `raw_evidence_summary` — the latter needs minLength=10).
+      - Filter out malformed sub-items in `findings` / `options` (missing
+        required sub-fields) so a single bad item doesn't kill the whole pass.
+
+    Only applies to dict responses. None pass-through unchanged (real failure).
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    DEFAULTS: dict[str, Any] = {
+        "pass_type": pass_type,
+        "findings": [],
+        "contradictions": [],
+        "options": [],
+        "verdict_hint": "INCOMPLETE_RESPONSE",
+        "raw_evidence_summary": "(no raw_evidence_summary in response; defensively injected)",
+    }
+    injected: list[str] = []
+    for k, v in DEFAULTS.items():
+        if k not in parsed or parsed[k] is None:
+            parsed[k] = v
+            injected.append(k)
+        elif k == "pass_type" and parsed[k] != pass_type:
+            # Perplexity sometimes echoes the WRONG pass_type (e.g. claims DECOMPOSE
+            # in response to a CRITIQUE prompt). Always trust the caller's intent.
+            log(f"Overriding pass_type {parsed[k]!r} → {pass_type!r} (caller authority)", "WARN")
+            parsed[k] = pass_type
+            injected.append(f"pass_type_overridden({k})")
+    # Filter findings missing required sub-fields rather than failing whole response.
+    REQUIRED_FINDING_KEYS = {"id", "severity", "claim", "phase", "source"}
+    REQUIRED_OPTION_KEYS = {"option_id", "label", "pros", "cons"}
+    if isinstance(parsed.get("findings"), list):
+        before = len(parsed["findings"])
+        cleaned_f = [f for f in parsed["findings"]
+                     if isinstance(f, dict) and REQUIRED_FINDING_KEYS.issubset(f.keys())]
+        if len(cleaned_f) != before:
+            injected.append(f"findings_filtered({before}→{len(cleaned_f)})")
+            parsed["findings"] = cleaned_f
+    if isinstance(parsed.get("options"), list):
+        before = len(parsed["options"])
+        cleaned_o = [o for o in parsed["options"]
+                     if isinstance(o, dict) and REQUIRED_OPTION_KEYS.issubset(o.keys())]
+        if len(cleaned_o) != before:
+            injected.append(f"options_filtered({before}→{len(cleaned_o)})")
+            parsed["options"] = cleaned_o
+    # raw_evidence_summary minLength=10 enforcement
+    res = parsed.get("raw_evidence_summary", "")
+    if isinstance(res, str) and len(res) < 10:
+        parsed["raw_evidence_summary"] = res + " (padded by defensive injection)"
+        injected.append("raw_evidence_summary_padded")
+    if injected:
+        log(f"Defensive injection on {pass_type} response: {', '.join(injected)}", "INFO")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -898,23 +1185,53 @@ def parse_advisory_response(text: str) -> dict | None:
     if cache_marker in body:
         body = body.split(cache_marker, 1)[0]
 
-    # Extract sections by H2 heading regex
+    # PATCH 2026-05-20 (Perplexity audit smoke #2 finding):
+    # Perplexity often outputs the response sections using BARE header names
+    # (no `## ` prefix) even when the prompt template uses `## HEADER`. Result:
+    # the prompt echo contains `## CURRENT STATE` etc. (template descriptions),
+    # and the model's actual response has plain `CURRENT STATE` on its own line.
+    # We must match BOTH forms and prefer the LAST occurrence of each known
+    # header so we extract the response prose, not the prompt template echo.
     sections: dict[str, str] = {}
-    pattern = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
-    matches = list(pattern.finditer(body))
-    for i, m in enumerate(matches):
-        title = m.group(1).strip()
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
-        section_body = body[start:end].strip()
-        # Match against known headers case-insensitively
-        for known in ADVISORY_SECTION_HEADERS:
-            if title.upper().startswith(known):
-                sections[known] = section_body
+    # Build a per-line list of (line_index, char_start, char_end, matched_header).
+    # A "header line" is either `## HEADER...` or a bare known-header line with
+    # nothing else on it (case-insensitive, allowing trailing colon/whitespace).
+    header_set = {h.upper(): h for h in ADVISORY_SECTION_HEADERS}
+    lines = body.splitlines(keepends=True)
+    line_offsets = [0]
+    for ln in lines[:-1]:
+        line_offsets.append(line_offsets[-1] + len(ln))
+    header_hits: list[tuple[int, int, str]] = []  # (line_index, char_offset, header)
+    for li, ln in enumerate(lines):
+        stripped = ln.strip()
+        # Tolerate trailing punctuation: "CODEBASE FIT", "CODEBASE FIT:", "**CODEBASE FIT**"
+        candidate = stripped.lstrip("#").strip().rstrip(":").strip()
+        candidate = candidate.strip("*").strip()
+        if not candidate or len(candidate) > 60:
+            continue
+        up = candidate.upper()
+        if up in header_set:
+            header_hits.append((li, line_offsets[li], header_set[up]))
+    # Group by header, take LAST hit (response, not template).
+    last_by_header: dict[str, tuple[int, int]] = {}  # header -> (line_index, char_offset)
+    for li, off, h in header_hits:
+        last_by_header[h] = (li, off)
+    # For each chosen hit, slice body from end-of-header-line to the next
+    # header-line (regardless of which header) so sections terminate properly.
+    sorted_hits = sorted(header_hits, key=lambda x: x[1])  # by char offset
+    for h, (li, off) in last_by_header.items():
+        end_of_header_line = off + len(lines[li])
+        # Find next header hit AFTER this one (any header).
+        next_off = len(body)
+        for ohli, ooff, _ohh in sorted_hits:
+            if ooff > off:
+                next_off = ooff
                 break
+        section_body = body[end_of_header_line:next_off].strip()
+        sections[h] = section_body
 
     if not sections:
-        # No H2 headings found -- not advisory format
+        # No advisory-style headers found -- not advisory format
         return None
 
     # Extract closing NEXT PASS RECOMMENDATION + VERDICT lines (search whole body)
@@ -1067,16 +1384,24 @@ def _advisory_to_legacy_shape(parsed: dict, pass_type: str, next_id_seed: str) -
                 "rationale": "advisory-mode parsed from NEXT PASS RECOMMENDATION line",
             }
 
-    return {
+    # PATCH 2026-05-20 (Perplexity audit re-smoke #2 finding):
+    # Schema requires `recommended_next_pass` to be an object when present, but
+    # FINAL_VERDICT (terminal pass) legitimately has no next pass to recommend,
+    # and any pass whose model response writes "TERMINATE: convergence reached"
+    # produces `recommended = None`. The schema field is OPTIONAL (not in
+    # `required`), so omit the key entirely when there is no real recommendation.
+    out = {
         "pass_type": pass_type,
         "findings": findings,
         "contradictions": contradictions,
         "options": [],  # advisory mode does not emit structured options; see SCRUTINY prose instead
         "verdict_hint": verdict_hint,
         "raw_evidence_summary": raw_evidence,
-        "recommended_next_pass": recommended,
         "_advisory": parsed,  # preserve original for report generation + debugging
     }
+    if recommended is not None:
+        out["recommended_next_pass"] = recommended
+    return out
 
 
 def _render_brief_block(running_brief: str) -> str:
@@ -1121,7 +1446,12 @@ def _render_next_pass_instruction() -> str:
 
 
 def build_prompt_decompose(artifact_body: str, next_id: str) -> str:
-    full = truncate_to_token_budget(artifact_body, ARTIFACT_TEXT_TOKEN_CAP * 2)  # DECOMPOSE gets bigger budget
+    # 2026-05-27: dropped DECOMPOSE multiplier from 2x to 1x. With the cap at
+    # 3500 tokens (~14 KB), 2x = 7000 tokens (~28 KB) puts DECOMPOSE back over
+    # the Perplexity browser-UI synthesis-render cliff (~20 KB), nullifying the
+    # cap entirely. If DECOMPOSE genuinely needs more context, the operator
+    # must precompress the artifact before running.
+    full = truncate_to_token_budget(artifact_body, ARTIFACT_TEXT_TOKEN_CAP)
     return f"""You are a research decomposition engine. Break the following artifact into 2-6 distinct, independently-researchable phases.
 
 This is Pass 1 — the bootstrap pass. Subsequent passes will build on what you decompose here.
@@ -1530,6 +1860,16 @@ def select_next_pass_type(ledger: dict, pass_num: int) -> tuple[str, dict | None
     if pass_num == 4:
         return "OPTIONS_SWEEP", None
 
+    # TODO(F-runner / 2026-05-27): FRESH_OBSERVER schedule rail fires here BEFORE the
+    # reserved-final-pass checks below at lines ~1720-1725. When max_passes == 8 these
+    # collide on pass_num == 8: FRESH_OBSERVER wins and FINAL_VERDICT never runs, so
+    # report.md ships without per-finding scored options. Same risk at any max_passes
+    # value that lands on the FRESH_OBSERVER schedule (8, 14, 20, ...). Fix: reorder so
+    # the `max_passes and pass_num == max_passes` check returns FINAL_VERDICT BEFORE
+    # this fresh_due block, OR add `and pass_num != max_passes` to the fresh_due guard.
+    # Mitigation in /extended-research skill (commands/extended-research.md Risk Register
+    # row "Runner-FRESH_OBSERVER-collision"): recommend --max-passes >= 9 for runs that
+    # need FINAL_VERDICT. Surfaced by E2E run plan-add-plan-synthesis-tail-9c9ce0b2.
     # Fresh observer at scheduled positions
     fresh_due = pass_num == 8 or (pass_num > 8 and (pass_num - 8) % 6 == 0)
     if fresh_due and not _has_recent_pass(ledger, "FRESH_OBSERVER", lookback=2):
@@ -1818,6 +2158,13 @@ def run_pass(ledger: dict, workdir: Path, pass_num: int, pass_type: str, target:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "invocation_id": invocation_id,
         "target_id": target["id"] if target else None,
+        # Phase 1 instrumentation (2026-05-29).
+        "prompt_len_chars": len(prompt) if prompt else 0,
+        "raw_response_len_chars": len(raw) if raw else 0,
+        "partial_prefix_attempted": False,
+        "partial_prefix_succeeded": False,
+        "retry_fired": False,
+        "backoff_s": 0.0,
     }
 
     if err:
@@ -1825,13 +2172,43 @@ def run_pass(ledger: dict, workdir: Path, pass_num: int, pass_type: str, target:
         pass_record["error"] = err
         log(f"PASS {pass_num} {pass_type} SKIPPED-NETWORK: {err}", "WARN")
         _append_passes_jsonl(workdir, pass_record, raw_response=None)
+        _emit_pass_instrumentation(workdir, pass_record)
         return pass_record
 
     parsed = _parse_response(raw or "", pass_type, next_id_seed=next_finding_id(ledger))
+    # Defensive injection BEFORE validation: fills in `pass_type` and other
+    # required fields the model may have dropped, filters malformed sub-items.
+    # This catches the most common "missing-field" PARSE-FAILED pattern that
+    # was triggering the 3-strike streak abort even when the response had
+    # useful content (per 2026-05-22 multi-run audit).
+    parsed = _defensive_inject_required(parsed, pass_type)
     ok, vmsg = validate_response(parsed)
     if not ok:
-        # Retry once with a stricter reminder
-        log(f"PASS {pass_num} {pass_type} schema-fail ({vmsg}); retrying once", "WARN")
+        # 2026-05-27 Tier 3 partial-JSON recovery: if `raw` looks like a JSON
+        # fragment that was truncated mid-stream (Perplexity's render stalled
+        # before the closing brace), try to salvage the longest balanced prefix
+        # before triggering a full retry. Free attempt — no new network call.
+        if raw and raw.strip().startswith("{"):
+            pass_record["partial_prefix_attempted"] = True
+            partial = _extract_longest_valid_json_prefix(raw)
+            if partial is not None:
+                log(f"PASS {pass_num} {pass_type} salvaged longest valid JSON prefix from truncated fragment", "WARN")
+                parsed_partial = _defensive_inject_required(partial, pass_type)
+                ok_p, _ = validate_response(parsed_partial)
+                if ok_p:
+                    pass_record["partial_prefix_succeeded"] = True
+                    parsed = parsed_partial
+                    ok = True
+
+    if not ok:
+        # Retry once with a stricter reminder + 20-25s jittered backoff to dodge
+        # Perplexity rate-limit cooldowns that follow a failed research query.
+        import random as _random
+        backoff_s = 20 + _random.uniform(0, 5)
+        pass_record["retry_fired"] = True
+        pass_record["backoff_s"] = backoff_s
+        log(f"PASS {pass_num} {pass_type} schema-fail ({vmsg}); sleeping {backoff_s:.1f}s before retry", "WARN")
+        time.sleep(backoff_s)
         if ADVISORY_MODE:
             retry_prompt = prompt + (
                 "\n\nREMINDER: Your previous response failed parsing. Use the eight required "
@@ -1842,14 +2219,30 @@ def run_pass(ledger: dict, workdir: Path, pass_num: int, pass_type: str, target:
         raw2, err2 = call_research_query(retry_prompt, invocation_id + "-r")
         if not err2:
             parsed = _parse_response(raw2 or "", pass_type, next_id_seed=next_finding_id(ledger))
+            parsed = _defensive_inject_required(parsed, pass_type)
             ok, vmsg = validate_response(parsed)
             raw = raw2 if raw2 else raw
+            # Also try partial-prefix salvage on the retry response.
+            if not ok and raw2 and raw2.strip().startswith("{"):
+                pass_record["partial_prefix_attempted"] = True
+                partial = _extract_longest_valid_json_prefix(raw2)
+                if partial is not None:
+                    log(f"PASS {pass_num} {pass_type} salvaged longest valid JSON prefix from retry response", "WARN")
+                    parsed_partial = _defensive_inject_required(partial, pass_type)
+                    ok_p, _ = validate_response(parsed_partial)
+                    if ok_p:
+                        pass_record["partial_prefix_succeeded"] = True
+                        parsed = parsed_partial
+                        ok = True
 
     if not ok:
         pass_record["status"] = "PARSE-FAILED"
         pass_record["error"] = vmsg
+        # Re-capture raw_response_len in case retry produced a longer response.
+        pass_record["raw_response_len_chars"] = len(raw) if raw else 0
         log(f"PASS {pass_num} {pass_type} PARSE-FAILED after retry: {vmsg}", "ERROR")
         _append_passes_jsonl(workdir, pass_record, raw_response=raw)
+        _emit_pass_instrumentation(workdir, pass_record)
         return pass_record
 
     # Merge findings, contradictions, options into ledger
@@ -1899,6 +2292,8 @@ def run_pass(ledger: dict, workdir: Path, pass_num: int, pass_type: str, target:
     update_running_brief(ledger, workdir, pass_num, pass_type, parsed, target)
 
     _append_passes_jsonl(workdir, pass_record, raw_response=raw)
+    pass_record["raw_response_len_chars"] = len(raw) if raw else 0
+    _emit_pass_instrumentation(workdir, pass_record)
     log(f"PASS {pass_num} {pass_type} COMPLETED net_new_findings={net_new} net_new_contras={len(new_contras)}")
     return pass_record
 
@@ -2135,6 +2530,20 @@ def main() -> int:
 
     artifact_body, _ = read_artifact(workdir)
 
+    # Pre-flight oversize warning. INTERIM PENDING PHASE 4 CALIBRATION — threshold
+    # 16 KB matches the new ~20 KB per-pass cap (5000 tokens). Original 18 KB was
+    # paired with the 3500-token cap.
+    _artifact_size_kb = len(artifact_body) / 1024
+    if _artifact_size_kb > 16:
+        log(
+            f"WARNING: artifact is {_artifact_size_kb:.1f} KB — approaching "
+            "Perplexity's ~20 KB browser-UI synthesis-render cliff. Pass-level "
+            "truncation will keep each prompt under ~20 KB, but multi-phase "
+            "coverage may suffer. Recommend either: (a) precompress the "
+            "artifact, or (b) re-run with --perplexity-advisory-runner.",
+            "WARN",
+        )
+
     # Fresh-observer summary — generated after DECOMPOSE (Pass 1) and frozen.
     fresh_summary_path = workdir / "fresh_observer_summary.txt"
     if fresh_summary_path.exists():
@@ -2239,6 +2648,17 @@ def main() -> int:
             log(f"Fresh-observer summary generated ({len(fresh_summary)} chars) — frozen for run")
 
         pass_num += 1
+        # PATCH 2026-05-20: inter-pass cooldown to avoid Perplexity backend
+        # throttling that produces 0-byte synthesis responses. Skip cooldown
+        # after the LAST pass (no next pass coming).
+        # PATCH 2026-05-26: dict.get(k, default) returns the actual value when
+        # the key is present-but-None — not the default. Coerce explicitly so
+        # `pass_num <= _cap` doesn't crash when max_passes is None (observed
+        # after a PARSE-FAILED early in the run left the ledger field unset).
+        _cap = ledger.get("max_passes") or 0
+        if INTER_PASS_SLEEP_S > 0 and pass_num <= _cap:
+            log(f"Inter-pass cooldown {INTER_PASS_SLEEP_S:.0f}s (PERPLEXITY_INTER_PASS_SLEEP_S)")
+            time.sleep(INTER_PASS_SLEEP_S)
 
     # Cleanup
     if termination_reason is None:

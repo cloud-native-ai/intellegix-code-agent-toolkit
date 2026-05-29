@@ -302,6 +302,43 @@ def _load_selectors() -> dict:
 
 
 
+def _is_reasoning_trail_only(text: str) -> bool:
+    """Heuristic: response contains only Perplexity's pre-synthesis thought bubbles.
+
+    On large-artifact research-mode queries (>20 KB input), Perplexity's browser
+    UI often renders only the reasoning trail ("Looking up X", "Checking Y") and
+    never mounts the synthesis body. The extractor reads the .prose container,
+    which contains this trail. Detecting that case lets callers trigger
+    PARSE-FAILED early instead of feeding garbage to the JSON parser.
+    """
+    if not text:
+        return True
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return True
+    reasoning_starts = (
+        "Looking up", "Looking into", "Checking ", "Preparing ",
+        "Searching for", "Analyzing", "Reviewing", "Validating ",
+    )
+    reasoning_count = sum(1 for ln in lines if ln.startswith(reasoning_starts))
+    # 2026-05-29 INTERIM PENDING PHASE 4 CALIBRATION.
+    # Raised from 1500 -> 2500 per /extended-research audit verdict — partial-mount
+    # stubs and legitimately concise research outputs can land in the 1500-2500
+    # band, and the old 1500 threshold likely caused false-positive blanking on
+    # valid responses.
+    #
+    # COUPLED ROLLBACK NOTE: this threshold widens the zone where the parser
+    # provisions in extended_research_runner.py:extract_json are responsible for
+    # catching wrapper-extraction issues. If those provisions are reverted, this
+    # threshold MUST also revert to <=1500 in the same change — banned rollback
+    # combo is "parser provisions out, threshold raised".
+    return (
+        reasoning_count >= 3
+        and reasoning_count / max(len(lines), 1) > 0.5
+        and len(text) < 2500
+    )
+
+
 class PerplexityCouncil:
     """Autonomous Playwright-based Perplexity automation.
 
@@ -340,6 +377,12 @@ class PerplexityCouncil:
         self.playwright = None
         self._browser = None  # Separate browser object (non-persistent mode)
         self.context = None
+        # CDP attach state (2026-05-21): set True when we've attached to a running
+        # session_keeper.py's headful Chrome via connect_over_cdp() instead of
+        # launching our own browser. In that mode, stop() must NOT close the
+        # context or kill the remote browser — we only own the pages we open.
+        self._cdp_attached = False
+        self._cdp_owned_pages: list = []
         self.page = None
         self._artifact_count = 0
         self._artifact_dir: Path | None = None
@@ -603,6 +646,15 @@ class PerplexityCouncil:
 
         self.playwright = await async_playwright().start()
 
+        # 2026-05-21 (Q5 architecture fix): try CDP attach to session_keeper.py first.
+        # When the keeper is running it owns a long-lived headful Chrome that Cloudflare
+        # trusts. Borrowing its context instead of launching our own browser eliminates
+        # the "cookies issued headful, headless can't validate" fingerprint asymmetry
+        # entirely — every research call uses the keeper's exact browser fingerprint.
+        if await self._start_via_cdp():
+            _log("CDP-attached to session_keeper; skipping local browser launch")
+            return
+
         if self.headless_fallback and self.headless:
             # Try headless first
             _log("Headless-fallback: trying headless launch first...")
@@ -637,6 +689,140 @@ class PerplexityCouncil:
             await self._start_persistent()
         else:
             await self._start_non_persistent()
+
+    async def _start_via_cdp(self) -> bool:
+        """Attach to a running session_keeper.py via Chrome DevTools Protocol.
+
+        Returns True on successful attach (caller skips local browser launch),
+        False to fall through to the launch path. Reads the keeper's CDP endpoint
+        from `~/.claude/config/session_keeper.cdp` and connects via
+        `chromium.connect_over_cdp()`. Reuses the keeper's existing context
+        (contexts[0]) which has the human-issued cookies + warm Cloudflare state.
+
+        We track pages we open in `self._cdp_owned_pages` so stop() can close
+        ONLY our pages, leaving the keeper's home tab intact.
+        """
+        # The CHROME subprocess that the keeper launched (with DETACHED_PROCESS) can
+        # outlive the keeper python — especially during Task Scheduler restart-on-
+        # failure cycles. What we actually need for CDP attach is "is the CDP port
+        # reachable", not "is the keeper python alive". Check the endpoint file
+        # first, then probe the port directly. Treat keeper-python liveness as a
+        # secondary signal (informational only).
+        cdp_file = Path.home() / ".claude" / "config" / "session_keeper.cdp"
+
+        # Fast path: if Chrome is already serving CDP on the default port,
+        # synthesize the endpoint file so we can attach. Covers the case where
+        # the keeper's Chrome is alive but the .cdp file was inadvertently
+        # removed (observed 2026-05-25 — user closed Chrome window, the file
+        # got cleaned up by some path, but Chrome's child processes kept
+        # serving the port).
+        if not cdp_file.exists():
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
+                    _ = _r.read()
+                # Port is up — write a fresh CDP file so the rest of the path
+                # can use it. The keeper would have written this normally.
+                cdp_file.parent.mkdir(parents=True, exist_ok=True)
+                cdp_file.write_text(
+                    json.dumps({"port": 9222, "endpoint": "http://127.0.0.1:9222"}),
+                    encoding="utf-8",
+                )
+                _log("CDP-attach: Chrome alive on 9222 but .cdp file missing — synthesized it")
+            except Exception:
+                pass  # port not reachable; fall through to keeper auto-start
+
+        # Auto-start the keeper task if CDP still isn't reachable. Avoids the
+        # headful local-launch fallback that creates focus-stealing popups.
+        if not cdp_file.exists():
+            _log("CDP not reachable — triggering PerplexitySessionKeeper scheduled task...")
+            try:
+                import subprocess
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Start-ScheduledTask -TaskName 'PerplexitySessionKeeper'"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                # Poll for CDP file (keeper writes it after initial warm — ~5-8s).
+                import time as _time
+                deadline = _time.time() + 20
+                while _time.time() < deadline:
+                    if cdp_file.exists():
+                        _log("Keeper task came up — CDP file present, proceeding")
+                        break
+                    _time.sleep(1)
+            except Exception as e:
+                _log(f"Keeper auto-start failed: {type(e).__name__}: {e}")
+
+        if not cdp_file.exists():
+            keeper_alive = self._is_session_keeper_running()
+            if keeper_alive:
+                _log("CDP-attach skipped: keeper alive but session_keeper.cdp missing (still warming up?)")
+            else:
+                _log("CDP-attach skipped: session_keeper not running and auto-start did not produce CDP endpoint")
+            return False
+        # Probe the CDP endpoint directly — works even if keeper python is mid-restart.
+        try:
+            data = json.loads(cdp_file.read_text(encoding="utf-8"))
+            endpoint_probe = data.get("endpoint", "")
+            if endpoint_probe:
+                import urllib.request as _ur
+                try:
+                    with _ur.urlopen(f"{endpoint_probe}/json/version", timeout=3) as _r:
+                        _ = _r.read()  # consume to verify CDP responds
+                except Exception as e:
+                    _log(f"CDP-attach skipped: endpoint {endpoint_probe} unreachable ({type(e).__name__}); falling back to launch")
+                    return False
+        except Exception:
+            pass  # let the connect_over_cdp below try and produce its own error
+        try:
+            data = json.loads(cdp_file.read_text(encoding="utf-8"))
+            endpoint = data.get("endpoint")
+            if not endpoint:
+                _log("CDP file present but no endpoint key — falling back to launch")
+                return False
+        except Exception as e:
+            _log(f"CDP file unreadable ({type(e).__name__}: {e}) — falling back to launch")
+            return False
+
+        try:
+            _log(f"Attaching to session_keeper via CDP at {endpoint} ...")
+            self._browser = await self.playwright.chromium.connect_over_cdp(endpoint)
+            contexts = self._browser.contexts
+            if not contexts:
+                _log("CDP attach: no contexts available (keeper not ready); fall back")
+                # IMPORTANT: do NOT call browser.close() on a CDP-connected
+                # browser — it sends Browser.close CDP which kills the remote
+                # Chrome (and the keeper). Just release the reference.
+                self._browser = None
+                return False
+            self.context = contexts[0]
+            self._cdp_attached = True
+            existing_count = len(self.context.pages)
+            _log(f"CDP attach OK: {len(contexts)} context(s); using contexts[0] with {existing_count} existing page(s)")
+
+            # Auto-cleanup stale /search/ pages from prior runs (orphans accumulate
+            # because killed/timed-out council_browser invocations don't get to run
+            # their CDP-aware stop() that closes _cdp_owned_pages). Past a certain
+            # count Chrome resources slow down and validate_session can silently
+            # exit. Keep the keeper's home tab(s) intact; close /search/ pages.
+            stale_closed = 0
+            for p in list(self.context.pages):
+                if "/search/" in (p.url or ""):
+                    try:
+                        await p.close()
+                        stale_closed += 1
+                    except Exception:
+                        pass
+            if stale_closed:
+                _log(f"CDP cleanup: closed {stale_closed} stale /search/ page(s) from prior runs")
+            return True
+        except Exception as e:
+            _log(f"CDP attach failed: {type(e).__name__}: {e}")
+            # IMPORTANT: do NOT call browser.close() — would kill remote Chrome.
+            self._browser = None
+            self._cdp_attached = False
+            return False
 
     async def _start_non_persistent(self) -> None:
         """Launch browser with an isolated temp profile directory.
@@ -732,7 +918,78 @@ class PerplexityCouncil:
         await self.context.add_init_script(self._stealth_scripts(fingerprint=fp))
 
     async def _load_session(self) -> None:
-        """Load session from playwright-session.json + playwright-localstorage.json."""
+        """Load session from playwright-session.json + playwright-localstorage.json.
+
+        Pre-flight: detect stale critical cookies (Cloudflare __cf_bm has a ~30min
+        TTL — if expired, Cloudflare serves a bot challenge that Playwright can't
+        pass, and the synthesis comes back 0 bytes silently). When detected:
+          - Always log a WARN with cookie names + minutes-since-expiry.
+          - If COUNCIL_AUTO_REFRESH=1, invoke refresh_session.py inline + reload.
+          - Otherwise continue with stale cookies (caller may still succeed if
+            Cloudflare is lenient now) but the WARN is the postmortem signal.
+        """
+        freshness = self._check_session_freshness(self.session_path)
+        if freshness["stale_critical"]:
+            stale_names = ", ".join(f"{n}({age}m ago)" for n, age in freshness["stale_critical"])
+            _log(f"WARNING: stale critical cookies detected: {stale_names}")
+
+            # Probe CDP first — the one-shot keeper architecture means pythonw
+            # is alive only ~3s per cycle, so PID-file check (_is_session_keeper_running)
+            # almost always returns False even when the keeper-managed Chrome
+            # is healthy. If Chrome is serving CDP, prefer refreshing THROUGH
+            # the keeper task (no popup) over refresh_session.py (headful popup).
+            chrome_alive = False
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
+                    _ = _r.read()
+                chrome_alive = True
+            except Exception:
+                chrome_alive = False
+
+            auto_refresh_env = os.environ.get("COUNCIL_AUTO_REFRESH", "").lower()
+            auto_refresh = auto_refresh_env not in ("0", "false", "no", "off")
+
+            if chrome_alive and auto_refresh:
+                # Keeper's Chrome is up — fire Start-ScheduledTask to refresh
+                # through it. Poll the cookies file's mtime for change as the
+                # readiness signal. No Chrome popup; ~3s typical.
+                _log("Keeper Chrome alive on CDP; firing PerplexitySessionKeeper task to refresh cookies in-place...")
+                try:
+                    import subprocess as _subprocess
+                    import time as _time
+                    mtime_before = self.session_path.stat().st_mtime if self.session_path.exists() else 0.0
+                    _subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Start-ScheduledTask -TaskName 'PerplexitySessionKeeper'"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    deadline = _time.time() + 15
+                    while _time.time() < deadline:
+                        try:
+                            mtime_now = self.session_path.stat().st_mtime
+                        except OSError:
+                            mtime_now = 0.0
+                        if mtime_now > mtime_before:
+                            _log("Keeper task refreshed cookies — reloading from disk")
+                            break
+                        _time.sleep(1)
+                    else:
+                        _log("WARNING: keeper task did not refresh cookies within 15s; proceeding")
+                except Exception as e:
+                    _log(f"Keeper-task refresh failed: {type(e).__name__}: {e}")
+            elif auto_refresh:
+                # No keeper Chrome — fall back to refresh_session.py (headful popup).
+                _log("No keeper Chrome on CDP; auto-refresh ON - invoking refresh_session.py ...")
+                refreshed = await self._auto_refresh_session()
+                if refreshed:
+                    _log("Auto-refresh succeeded; reloading cookies from disk")
+                else:
+                    _log("WARNING: auto-refresh failed; proceeding with stale cookies")
+            else:
+                _log("COUNCIL_AUTO_REFRESH=0 (opt-out) - proceeding with stale cookies")
+                _log("Hint: `python session_keeper.py` for persistent refresh OR `python refresh_session.py` for one-shot")
+
         try:
             data = json.loads(self.session_path.read_text(encoding="utf-8"))
 
@@ -750,6 +1007,106 @@ class PerplexityCouncil:
 
         except Exception as e:
             _log(f"WARNING: Failed to load cookies: {e}")
+
+    @staticmethod
+    def _check_session_freshness(session_path: Path) -> dict:
+        """Return {stale_critical: [(name, minutes_expired)], all_count: N, expired_count: N}.
+
+        Critical cookies are Cloudflare/Perplexity short-TTL ones that, when expired,
+        produce silent 0-byte synthesis responses from Perplexity research mode.
+        """
+        CRITICAL = {"__cf_bm", "pplx.edge-sid", "pplx.session-id"}
+        result = {"stale_critical": [], "all_count": 0, "expired_count": 0}
+        try:
+            data = json.loads(session_path.read_text(encoding="utf-8"))
+        except Exception:
+            return result
+        if not isinstance(data, list):
+            return result
+        now = time.time()
+        for c in data:
+            result["all_count"] += 1
+            exp = c.get("expires", -1)
+            if not isinstance(exp, (int, float)) or exp <= 0:
+                continue  # session cookie or no expiry
+            if exp < now:
+                result["expired_count"] += 1
+                name = c.get("name", "")
+                if name in CRITICAL:
+                    result["stale_critical"].append((name, int((now - exp) / 60)))
+        return result
+
+    @staticmethod
+    def _is_session_keeper_running() -> bool:
+        """Detect a running session_keeper.py via its PID file.
+
+        Windows: os.kill(pid, 0) for a non-existent PID raises generic OSError
+        (not ProcessLookupError as on Unix). PermissionError on either OS means
+        the process exists but is inaccessible — treat as alive. All other
+        OSError or ProcessLookupError → treat as stale and clear the file.
+        """
+        pid_file = Path.home() / ".claude" / "config" / "session_keeper.pid"
+        if not pid_file.exists():
+            return False
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True  # process exists, just inaccessible (cross-user on Windows)
+        except (ProcessLookupError, OSError, SystemError):
+            # Windows signal 0 isn't valid for TerminateProcess — os.kill raises
+            # OSError(WinError 87) which CPython surfaces as SystemError. Fall
+            # back to a Windows-native check via ctypes.OpenProcess before
+            # treating the PID as stale.
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    handle = ctypes.windll.kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+                    )
+                    if handle:
+                        ctypes.windll.kernel32.CloseHandle(handle)
+                        return True
+                except Exception:
+                    pass
+            try:
+                pid_file.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+
+    async def _auto_refresh_session(self) -> bool:
+        """Invoke refresh_session.py via subprocess.run (in a thread) to refresh stale cookies."""
+        import shutil as _shutil
+        import subprocess as _subprocess
+        refresh_script = Path(__file__).parent / "refresh_session.py"
+        if not refresh_script.exists():
+            _log(f"refresh_session.py not found at {refresh_script}")
+            return False
+        python_path = _shutil.which("python") or sys.executable
+        argv = [python_path, str(refresh_script)]
+        def _run() -> tuple[int, str]:
+            try:
+                proc = _subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                return proc.returncode, (proc.stderr or "")[-300:]
+            except _subprocess.TimeoutExpired:
+                return -1, "refresh_session.py timed out after 60s"
+        try:
+            rc, stderr_tail = await asyncio.to_thread(_run)
+            if rc != 0:
+                _log(f"refresh_session.py exit={rc}; stderr tail: {stderr_tail}")
+                return False
+            return True
+        except Exception as e:
+            _log(f"refresh_session.py invoke failed: {type(e).__name__}: {e}")
+            return False
 
         # Inject localStorage from companion file (critical for pplx-next-auth-session)
         ls_path = self.session_path.parent / "playwright-localstorage.json"
@@ -796,6 +1153,8 @@ class PerplexityCouncil:
     async def validate_session(self) -> bool:
         """Check if we're logged in to Perplexity."""
         page = await self.context.new_page()
+        if self._cdp_attached:
+            self._cdp_owned_pages.append(page)
         try:
             await page.goto("https://www.perplexity.ai/", wait_until="domcontentloaded", timeout=30000)
             # Wait a moment for JS to hydrate
@@ -1368,17 +1727,117 @@ class PerplexityCouncil:
             pass
         return False
 
+    async def _wait_content_stability(
+        self,
+        page,
+        stable_s: int,
+        min_chars: int,
+        max_s: int,
+        start: float,
+        label: str = "stability",
+    ) -> str:
+        """Content-stability completion poll for Perplexity research/labs mode.
+
+        Polls div.prose.max-w-none every 500ms. Declares STABLE when content
+        length is >= min_chars AND has not changed for stable_s consecutive
+        seconds. Declares NO_GROWTH if no content appears within the first
+        30s (caller should fall back to stop-button detection). Declares
+        GROWING if max_s elapsed while content is still changing — caller
+        should switch to a slower detector with a longer ceiling.
+
+        Returns one of: "STABLE" | "GROWING" | "NO_GROWTH".
+        2026-05-22 Q5 followup: catches ultra-short research-mode queries
+        whose answer is rendered before the stop button becomes visible.
+        """
+        import hashlib as _hashlib
+        # PATCH 2026-05-22 (Perplexity DOM drift): research mode now renders the
+        # answer in `div.prose` (no `.max-w-none` modifier). The old selector
+        # was matching a small loading-skeleton placeholder div with ~3 chars
+        # and never falling through to the longer real-content div. Fix: always
+        # pick the LONGEST .prose element — robust to skeleton placeholders +
+        # multiple prose blocks (intro summary + main answer).
+        POLL_INTERVAL_S = 0.5
+        NO_GROWTH_GRACE_S = 30  # if zero content by this point, give up to caller
+
+        last_len = 0
+        last_hash = ""
+        stable_since: float | None = None
+        deadline = start + max_s
+        no_growth_deadline = start + NO_GROWTH_GRACE_S
+
+        while time.time() < deadline:
+            await asyncio.sleep(POLL_INTERVAL_S)
+            try:
+                text = await page.evaluate("""
+                    () => {
+                        // 1. Longest .prose element — handles long-form research answers,
+                        //    DECOMPOSE-style JSON outputs, etc. (Perplexity DOM as of 2026-05-22)
+                        const proses = document.querySelectorAll('div.prose, .prose');
+                        let best = '';
+                        for (const e of proses) {
+                            const t = e.innerText || '';
+                            if (t.length > best.length) best = t;
+                        }
+                        if (best.length > 50) return best;
+
+                        // 2. Fallback: <main> element with UI chrome stripped.
+                        //    Short research answers (e.g. "What is 300+300?" → "600") render
+                        //    inside <main> but NOT inside any .prose div. Strip the static
+                        //    tab labels and footer controls that appear around the answer.
+                        const main = document.querySelector('main');
+                        if (!main) return best;
+                        const raw = main.innerText || '';
+                        const chrome = new Set([
+                            'Answer', 'Links', 'Images', 'Share', 'Sources',
+                            'Ask a follow-up', 'Search', 'Model', 'Steps', 'Tasks',
+                        ]);
+                        const cleaned = raw
+                            .split('\\n')
+                            .map(s => s.trim())
+                            .filter(s => s && !chrome.has(s))
+                            .join('\\n');
+                        return cleaned.length > best.length ? cleaned : best;
+                    }
+                """)
+            except Exception:
+                text = ""
+
+            cur_len = len(text or "")
+            cur_hash = _hashlib.md5((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+            # NO_GROWTH path: nothing rendered after the grace window → bail to caller.
+            if cur_len == 0 and time.time() > no_growth_deadline:
+                _log(f"Smart[{label}]: no content growth in {NO_GROWTH_GRACE_S}s — yielding to caller")
+                return "NO_GROWTH"
+
+            if cur_len != last_len or cur_hash != last_hash:
+                # Content changed — reset stability window.
+                stable_since = None
+                last_len = cur_len
+                last_hash = cur_hash
+            else:
+                # Content unchanged this tick.
+                if cur_len >= min_chars:
+                    if stable_since is None:
+                        stable_since = time.time()
+                    elif time.time() - stable_since >= stable_s:
+                        _log(f"Smart[{label}]: stable {stable_s}s @ {cur_len} chars — complete")
+                        return "STABLE"
+
+        _log(f"Smart[{label}]: max_s={max_s} reached, content still growing or below threshold ({last_len} chars) — yielding to caller")
+        return "GROWING"
+
     async def _wait_research_smart(self, page, timeout: int, start: float) -> bool:
         """Smart completion detection for research/labs modes.
 
-        Signal hierarchy:
+        Signal hierarchy (revised 2026-05-22):
+        0. NEW Fast-path: content-stability poll of div.prose.max-w-none. Catches
+           ultra-short queries (e.g. "What is 2+2?") that resolve in <10s and
+           never render a visible stop button. ~60s ceiling. If content keeps
+           growing past the threshold, falls through to (1).
         1. Primary: stop button cycle (appeared → disappeared with debounce)
         2. Confirming: MutationObserver stability OR text stability (10s window)
         3. Fallback: existing _wait_research_fallback() with reduced guards
-
-        If the stop button disappears suspiciously fast (<30s), waits for
-        a confirming signal before accepting. If stop button never appears,
-        falls through to the CSS/text-stability fallback.
         """
         min_gen_s = BROWSER_MIN_GENERATION_TIME_MS / 1000
         confirm_s = BROWSER_CONFIRMATION_WINDOW_MS / 1000
@@ -1386,6 +1845,31 @@ class PerplexityCouncil:
 
         # Inject MutationObserver early
         await self._inject_mutation_observer(page)
+
+        # NEW (2026-05-22 Q5 followup): content-stability fast-path for short queries.
+        # Tries SIMPLE profile (3s stable / 10+ chars / 60s ceiling). If content
+        # grows AND stabilizes inside that window, return immediately. If content
+        # is still growing at 60s, fall through to the existing detector (handles
+        # deep research). If zero growth seen, also fall through.
+        fast_path = await self._wait_content_stability(
+            page, stable_s=3, min_chars=10, max_s=60, start=start, label="fast-path"
+        )
+        if fast_path == "STABLE":
+            # 2026-05-27 synthesis-mount guard: stability alone is insufficient.
+            # Perplexity can leave a partial-mount shell stable at <200 chars
+            # while only the reasoning trail rendered (the synthesis body never
+            # mounts on large-artifact queries). Wait briefly for real content
+            # to appear before declaring complete.
+            try:
+                await page.wait_for_function(
+                    "() => (document.querySelector('.prose')?.innerText?.length ?? 0) > 200",
+                    timeout=20000,
+                )
+                _log("Smart: synthesis content mounted (>200 chars in .prose); complete")
+            except Exception:
+                _log("Smart: .prose stable but never exceeded 200 chars — reasoning-only response likely; proceeding to extraction anyway")
+            return True
+        # else GROWING or NO_GROWTH → fall through to stop-button cycle
 
         # Primary signal: stop button cycle
         stop_cycle = await self._wait_for_stop_button_cycle(page, timeout, start)
@@ -1969,20 +2453,45 @@ class PerplexityCouncil:
 
         # Extract synthesis/report text — different selectors per mode
         if self.perplexity_mode in ("research", "labs"):
-            # Research mode: full report is in the right panel (prose.max-w-none)
+            # Research mode: try longest .prose first (long-form answers), then
+            # fall back to <main> with UI chrome stripped (short answers like
+            # "What is 500+500?" → "1000" which Perplexity renders OUTSIDE any
+            # .prose container as of 2026-05-22 DOM drift).
             try:
                 text = await page.evaluate("""() => {
-                    // Primary: right panel with full research report
-                    const report = document.querySelector('div.prose.max-w-none');
-                    if (report && report.innerText.length > 100) return report.innerText;
-                    // Fallback: find the largest prose element on the page
-                    const proses = Array.from(document.querySelectorAll('div.prose'));
-                    if (proses.length === 0) return '';
-                    proses.sort((a, b) => b.innerText.length - a.innerText.length);
-                    return proses[0].innerText || '';
+                    // 1. Longest .prose element — handles long-form answers.
+                    const proses = Array.from(document.querySelectorAll('div.prose, .prose'));
+                    let best = '';
+                    for (const e of proses) {
+                        const t = e.innerText || '';
+                        if (t.length > best.length) best = t;
+                    }
+                    if (best.length > 50) return best;
+                    // 2. Fallback: <main> innerText with UI chrome stripped.
+                    const main = document.querySelector('main');
+                    if (!main) return best;
+                    const raw = main.innerText || '';
+                    const chrome = new Set([
+                        'Answer', 'Links', 'Images', 'Share', 'Sources',
+                        'Ask a follow-up', 'Search', 'Model', 'Steps', 'Tasks',
+                    ]);
+                    const cleaned = raw
+                        .split('\\n')
+                        .map(s => s.trim())
+                        .filter(s => s && !chrome.has(s))
+                        .join('\\n');
+                    return cleaned.length > best.length ? cleaned : best;
                 }""")
-                results["synthesis"] = text
-                _log(f"Extracted research report: {len(results['synthesis'])} chars")
+                # 2026-05-27 reasoning-trail guard: on large-artifact queries,
+                # Perplexity sometimes leaves only "Looking up X / Checking Y"
+                # in .prose with no synthesis body. Detect and blank out so
+                # downstream JSON parsing fails cleanly and retry-once fires.
+                if _is_reasoning_trail_only(text):
+                    _log(f"WARNING: extracted text appears reasoning-trail-only ({len(text)} chars) — treating as empty for clean retry-once")
+                    results["synthesis"] = ""
+                else:
+                    results["synthesis"] = text
+                    _log(f"Extracted research report: {len(results['synthesis'])} chars")
             except Exception as e:
                 _log(f"WARNING: Failed to extract research report: {e}")
         else:
@@ -2125,6 +2634,22 @@ class PerplexityCouncil:
             _log("Starting Playwright browser...")
             await self.start()
 
+            # CDP-attached sessions share the keeper's Chrome — no per-session
+            # browser was launched, so the semaphore slot isn't actually
+            # serving its purpose (which is to limit concurrent local Chrome
+            # launches). Release it immediately so other sessions can attach
+            # without hitting BROWSER_BUSY when slots are full of stale entries
+            # from crashed prior runs. submission_lock still serializes the
+            # focus-sensitive submit step across all sessions.
+            if self._cdp_attached and self._semaphore is not None:
+                try:
+                    self._semaphore.release()
+                    _log(f"CDP-attached; released semaphore slot {self.instance_id} (other sessions can attach freely)")
+                except Exception as _sem_rel_err:
+                    _log(f"WARN: semaphore release on CDP-attach failed: {_sem_rel_err}")
+                self._semaphore = None
+                self.instance_id = -1
+
             _log("Validating session...")
             if not await self.validate_session():
                 # Cloudflare may have blocked non-persistent context — retry with temp profile
@@ -2145,6 +2670,8 @@ class PerplexityCouncil:
 
             # Open a new page for the query
             page = await self.context.new_page()
+            if self._cdp_attached:
+                self._cdp_owned_pages.append(page)
 
             try:
                 _log("Navigating to Perplexity...")
@@ -2203,6 +2730,15 @@ class PerplexityCouncil:
                 await page.close()
 
         except Exception as e:
+            # DIAG (2026-05-20): surface full traceback so silent-swallow failures
+            # (Chrome profile collision under concurrent runners, ProcessSingleton races,
+            # Cloudflare bot-challenge during launch) leave evidence in stderr instead of
+            # just an opaque str(e). Investigation 2026-05-20 showed Pattern B's 2-second
+            # exit was masked here when PID 17996 contended for submit_lock + Chrome profile.
+            import traceback as _tb_run
+            _log(f"council.run UNHANDLED {type(e).__name__}: {e}")
+            _tb_run.print_exc(file=sys.stderr)
+            sys.stderr.flush()
             # Try to capture artifact on unhandled exception
             if self.context:
                 try:
@@ -2213,6 +2749,7 @@ class PerplexityCouncil:
                     pass
             return {
                 "error": str(e),
+                "error_type": type(e).__name__,
                 "step": "unknown",
                 "execution_time_ms": int((time.time() - start_time) * 1000),
             }
@@ -2228,7 +2765,13 @@ class PerplexityCouncil:
                     _log("submit_lock released (defensive)")
                 except Exception:
                     pass
-            self._semaphore.release()
+            # Guard: _semaphore may have been released + nulled earlier in this
+            # method (CDP-attached path releases right after self.start()).
+            if self._semaphore is not None:
+                try:
+                    self._semaphore.release()
+                except Exception:
+                    pass
 
     async def save_session(self) -> None:
         """Save current browser session for future headless use."""
@@ -2277,7 +2820,38 @@ class PerplexityCouncil:
             _log(f"WARNING: Failed to capture localStorage: {e}")
 
     async def stop(self) -> None:
-        """Close browser, Playwright, and clean up temp resources."""
+        """Close browser, Playwright, and clean up temp resources.
+
+        CDP-attached mode (2026-05-21): we're sharing session_keeper.py's
+        long-lived headful Chrome. Closing the context would kill the keeper's
+        whole browser window — instead close ONLY the pages we opened (tracked
+        in self._cdp_owned_pages), then detach Playwright from the remote Chrome
+        via browser.close() which only severs the connection, not the process.
+        """
+        if self._cdp_attached:
+            # CDP-attached cleanup: close only pages we opened; leave the keeper's
+            # context + remote Chrome alive. Critical correction (2026-05-21):
+            # browser.close() on a CDP-connected browser sends Browser.close CDP
+            # command which TERMINATES the remote Chrome process (and kills the
+            # keeper). Skip it. Just stop our Playwright client; the keeper's
+            # own Playwright connection survives unaffected.
+            for page in list(self._cdp_owned_pages):
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                except Exception:
+                    pass
+            self._cdp_owned_pages.clear()
+            self.context = None
+            self._browser = None  # release ref but DO NOT call .close()
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception:
+                    pass
+            self._cdp_attached = False
+            return
+
         if self.context:
             try:
                 await self.context.close()

@@ -34,6 +34,62 @@ if sys.stdout.encoding != "utf-8":
 if sys.stderr.encoding != "utf-8":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+# DIAG (2026-05-20): surface ANY unhandled exception that would otherwise exit silently.
+# Investigation showed council_query subprocesses exit 0 with empty stdout/stderr — pointing
+# at a swallowed-exception path inside run_browser_query. These hooks force a traceback.
+import traceback as _traceback
+
+def _diag_excepthook(exc_type, exc_val, tb):
+    print(f"[DIAG-UNHANDLED] {exc_type.__name__}: {exc_val}", file=sys.stderr, flush=True)
+    _traceback.print_tb(tb, file=sys.stderr)
+    sys.stderr.flush()
+
+def _diag_unraisablehook(unraisable):
+    print(f"[DIAG-UNRAISABLE] {unraisable.exc_type.__name__}: {unraisable.exc_value}", file=sys.stderr, flush=True)
+    if unraisable.exc_traceback:
+        _traceback.print_tb(unraisable.exc_traceback, file=sys.stderr)
+    sys.stderr.flush()
+
+sys.excepthook = _diag_excepthook
+sys.unraisablehook = _diag_unraisablehook
+
+# DIAG bookend logging is gated behind COUNCIL_DIAG=1 to avoid stderr noise on
+# multi-pass extended_research runs. Excepthook + unraisablehook + traceback on
+# error stay always-on (zero happy-path cost). Per Perplexity verification audit
+# 2026-05-20: gate verbose bookends, keep error-path traceback.
+_DIAG = os.environ.get("COUNCIL_DIAG", "").lower() in ("1", "true", "yes", "on")
+
+# DIAG: log any swallowed asyncio task exception that gets garbage-collected without retrieval.
+import asyncio as _asyncio_diag
+def _diag_asyncio_exception_handler(loop, context):
+    msg = context.get("message", "(no message)")
+    exc = context.get("exception")
+    print(f"[DIAG-ASYNCIO-LOOP] {msg}", file=sys.stderr, flush=True)
+    if exc:
+        print(f"  exception: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        if exc.__traceback__:
+            _traceback.print_tb(exc.__traceback__, file=sys.stderr)
+    sys.stderr.flush()
+
+# Apply the handler when the event loop is created.
+_original_run = _asyncio_diag.run
+def _diag_asyncio_run(coro, *args, **kwargs):
+    """Wrap asyncio.run to install our exception handler and surface failures."""
+    try:
+        loop_policy = _asyncio_diag.get_event_loop_policy()
+        # Note: asyncio.run() creates a new loop, so we install the handler via a wrapper coro
+        async def _runner():
+            loop = _asyncio_diag.get_running_loop()
+            loop.set_exception_handler(_diag_asyncio_exception_handler)
+            return await coro
+        return _original_run(_runner(), *args, **kwargs)
+    except BaseException as e:
+        # Surface and re-raise — let the excepthook handle the print.
+        print(f"[DIAG-ASYNCIO-RUN-RAISED] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        raise
+
+_asyncio_diag.run = _diag_asyncio_run
+
 import anthropic
 
 from council_config import (
@@ -672,13 +728,54 @@ async def run_browser_query(
     kwargs = {"save_artifacts": opus_synthesis, "perplexity_mode": perplexity_mode}
     if headful is not None:
         kwargs["headless"] = not headful
-    council = PerplexityCouncil(**kwargs)
+    if _DIAG: print(f"[DIAG run_browser_query] BEFORE PerplexityCouncil() kwargs={kwargs} qlen={len(full_query)}", file=sys.stderr, flush=True)
+    # PATCH 2026-05-20 (Perplexity audit Q1): move PerplexityCouncil instantiation
+    # INSIDE the try block so that __init__ failures (missing config, bad selectors)
+    # get the same traceback + bookend treatment as council.run() failures. Previously
+    # PerplexityCouncil() sat outside the try; any __init__ raise fell through to the
+    # outer `except ImportError` (which only catches ImportError) and died silently.
+    council = None
+    browser_result = None
     try:
+        council = PerplexityCouncil(**kwargs)
+        if _DIAG: print(f"[DIAG run_browser_query] AFTER PerplexityCouncil() instance={council!r}", file=sys.stderr, flush=True)
+        if _DIAG: print("[DIAG run_browser_query] CALLING council.run() ...", file=sys.stderr, flush=True)
         browser_result = await council.run(full_query)
+        if _DIAG: print(f"[DIAG run_browser_query] council.run() RETURNED type={type(browser_result).__name__} keys={list(browser_result.keys()) if isinstance(browser_result, dict) else 'N/A'}", file=sys.stderr, flush=True)
+    except BaseException as e:
+        # Always-on traceback on error path (zero cost in happy path).
+        print(f"[DIAG run_browser_query] FAILED {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        import traceback as _tb_diag
+        _tb_diag.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
     finally:
-        await council.stop()
+        if council is not None:
+            if _DIAG: print("[DIAG run_browser_query] CALLING council.stop() ...", file=sys.stderr, flush=True)
+            try:
+                await council.stop()
+                if _DIAG: print("[DIAG run_browser_query] council.stop() returned", file=sys.stderr, flush=True)
+            except BaseException as e:
+                # Always-on: stop() failures are real and worth surfacing.
+                print(f"[DIAG run_browser_query] council.stop() FAILED {type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
     # Diagnostic: warn if browser returned no synthesis (Bug 3 investigation)
+    if browser_result is None:
+        print("[DIAG run_browser_query] browser_result is None (council.run raised or returned None)", file=sys.stderr, flush=True)
+        return {
+            "query": query,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": "browser",
+            "models": {},
+            "synthesis": {"response": None, "error": "council.run returned None"},
+            "total_cost": 0,
+            "execution_time_ms": int((time.time() - start) * 1000),
+            "error": "council.run returned None",
+            "code": "NULL_RESULT",
+            "step": "run_browser_query",
+            "fallback_log": [],
+            "degraded": True,
+        }
     if not browser_result.get("error") and not browser_result.get("synthesis"):
         print(
             f"WARNING: browser_result has no synthesis. "

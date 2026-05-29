@@ -166,6 +166,14 @@ async def refresh_session(
             "--no-first-run",
             "--no-default-browser-check",
         ]
+        # NOTE 2026-05-20: tried hiding the headful Chrome window via
+        # `--window-position=-2000,-2000` and `--start-minimized` — both tripped
+        # Cloudflare/Perplexity bot detection (cookies refreshed successfully, but
+        # subsequent headless council_browser validation failed: "Session invalid:
+        # input element not found"). Reverted to NO window-hiding args; accepting
+        # the visible Chrome pop-up during refresh as the cost of reliable cookies.
+        # The pop-up is brief (~6s, auto-closes) and only fires when critical
+        # cookies are stale (once per ~30min during active use).
         browser = await pw.chromium.launch(
             channel="chrome",
             headless=headless,
@@ -229,13 +237,40 @@ async def refresh_session(
         }""")
         _log(f"Extracted {len(fresh_localstorage)} localStorage items")
 
+        # Filter out cookies that are already expired or expiring within 60 seconds
+        # (per 2026-05-20 production audit + smoke-test correction). Originally tried
+        # a 1-hour threshold but that dropped freshly-issued __cf_bm / pplx.edge-sid
+        # cookies (their natural TTL is ~30min, so 29min remaining is NORMAL, not
+        # near-death). The auto-refresh-on-stale-detect hook in council_browser.py
+        # handles runtime freshness; this filter only catches imminently-expiring or
+        # already-dead entries that survived context.cookies() somehow. Session
+        # cookies (expires == -1 or 0) are always kept.
+        now = time.time()
+        SHORT_TTL_DROP_THRESHOLD_S = 60  # drop only cookies < 60s from expiry
+        before = len(fresh_cookies)
+        filtered_cookies = []
+        dropped: list[str] = []
+        for c in fresh_cookies:
+            exp = c.get("expires", -1)
+            if isinstance(exp, (int, float)) and exp > 0 and (exp - now) < SHORT_TTL_DROP_THRESHOLD_S:
+                ttl_min = (exp - now) / 60
+                ttl_label = f"{ttl_min:.1f}m" if ttl_min >= 0 else "EXPIRED"
+                dropped.append(f"{c.get('name')}({ttl_label})")
+                continue
+            filtered_cookies.append(c)
+        if dropped:
+            _log(f"Dropped {len(dropped)} imminently-expiring cookies: {', '.join(dropped[:8])}{'...' if len(dropped) > 8 else ''}")
+        else:
+            _log("No cookies dropped (all fresh or session-scoped)")
+        _log(f"Saving {len(filtered_cookies)}/{before} cookies after short-TTL filter")
+
         # Save cookies in Playwright-native format
         sess_path.parent.mkdir(parents=True, exist_ok=True)
         sess_path.write_text(
-            json.dumps(fresh_cookies, indent=2, default=str),
+            json.dumps(filtered_cookies, indent=2, default=str),
             encoding="utf-8",
         )
-        _log(f"Saved {len(fresh_cookies)} cookies to {sess_path}")
+        _log(f"Saved {len(filtered_cookies)} cookies to {sess_path}")
 
         # Save localStorage
         if fresh_localstorage:

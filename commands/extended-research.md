@@ -42,6 +42,42 @@ reference the row above rather than re-deriving the limitation.
 
 ## What Claude Does When Invoked
 
+### Step 0 — Routing Pre-Flight (MANDATORY, runs before any other step)
+
+Before doing ANY other work, evaluate whether this invocation matches the right tool. Score the FOCUS AREA + compiled session context against the 5 signals below. Each YES = +1 point.
+
+| # | Signal | YES condition |
+|---|---|---|
+| S1 | Large output | Expected artifact > 2K tokens / 8KB |
+| S2 | Multi-component | Touches ≥ 3 interacting components/services |
+| S3 | Open trade-off | Multiple defensible answers exist (not a known-right lookup) |
+| S4 | High blast radius | Wrong answer = broken architecture for months (auth, schema, contract design, async/distributed boundaries) |
+| S5 | Adversarial divergence | A second expert could plausibly disagree with the first answer |
+
+**Routing rules (this tool: /extended-research):**
+
+| Invoked tool | Score | Action |
+|---|---|---|
+| /research-perplexity | ≥ 3 | AUTO-SWITCH UP to /extended-research |
+| /research-perplexity | = 2 | ASK USER: basic or extended? |
+| /research-perplexity | ≤ 1 | Proceed as called |
+| /extended-research | ≥ 2 | Proceed as called |
+| /extended-research | ≤ 1 | ASK USER: switch down to basic? (NEVER auto-down) |
+
+**Asymmetric override:**
+- UP-override allowed: if you spot a specific architectural risk not captured by the 5 signals (e.g., touches auth, payments, multi-service state), you MAY force UP-switch. You MUST name the risk in one sentence before proceeding.
+- DOWN-override FORBIDDEN: you may NEVER auto-down-switch from /extended-research. Only the user can.
+
+**Visibility (always emit one of these lines before next step):**
+- Auto-switch: `[routing] score=N — auto-switching to /OTHER-TOOL (signals: S1, S2, ...)`
+- Ask: `[routing] score=N (signals: ...) — basic or extended?` then wait for user reply
+- Override UP: `[routing] override UP — risk: {one-sentence risk}. Switching.`
+- Proceed: `[routing] score=N — proceeding with /extended-research.`
+
+**On UP-switch from /research-perplexity:** invoke /extended-research workflow starting at its Step 1 (Parse and stage). Pass the original FOCUS AREA as the artifact. Add a one-line note in the DECOMPOSE prompt: `[ROUTED-FROM-BASIC: pre-flight detected this needs multi-pass — DECOMPOSE more aggressively]`. The basic tool never executed its synthesis pass, so there's no prior output to feed.
+
+**On DOWN-switch from /extended-research (user-confirmed only):** when user replies "yes, basic" / "switch down" / equivalent to the ASK prompt, invoke /research-perplexity workflow starting at its Step 1 (Compile Session Context). Pass the original FOCUS AREA. Emit one-line audit notice: `[routing] user confirmed down-switch — using /research-perplexity instead.` Steps 1-9 below do NOT execute.
+
 ### Step 1 — Parse and stage
 
 Claude extracts the artifact (everything after flags) and the flag values. If the artifact looks like a file path (`./blueprint.md` or absolute), Claude `Read`s it. Otherwise treats it as inline text.

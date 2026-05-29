@@ -2679,6 +2679,26 @@ def main() -> int:
     # from runs that failed strict JSON parsing.
     write_salvaged_responses(workdir)
 
+    # Phase 2 (2026-05-29 follow-ups): consume per-pass instrumentation into
+    # the global calibration summary. Fire-and-forget — never blocks runner.
+    # Step 7 critique Q2: WARN when aggregator returns zero rows on a non-empty
+    # source so silent failure is visible in runner.log instead of only via CLI.
+    try:
+        from calibration_log import aggregate_run, append_to_global_summary
+        jsonl_path = workdir / "instrumentation.jsonl"
+        run_summary = aggregate_run(workdir)
+        if run_summary.get("entry_count", 0) == 0:
+            if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+                log(
+                    f"calibration_log aggregation produced zero rows from non-empty "
+                    f"source {jsonl_path} ({jsonl_path.stat().st_size} bytes) — "
+                    "inspect manually with `python calibration_log.py`",
+                    "WARN",
+                )
+        append_to_global_summary(run_summary)
+    except Exception as _calib_e:
+        log(f"calibration_log aggregation skipped: {type(_calib_e).__name__}: {_calib_e}", "WARN")
+
     # Sentinel for Claude to detect completion
     (workdir / "runner.log.done").write_text(datetime.now(timezone.utc).isoformat() + "\n")
     log(f"DONE. Termination: {termination_reason}")

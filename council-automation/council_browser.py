@@ -302,6 +302,31 @@ def _load_selectors() -> dict:
 
 
 
+# Phase 3 (2026-05-29 follow-ups) per-query instrumentation. Mirrors the
+# extended_research_runner._emit_pass_instrumentation pattern: write to
+# ~/.claude/council-cache/instrumentation-query.jsonl with 10 MB tail-truncate
+# at write time. Fail-open — never raises.
+_QUERY_INST_LOG = Path.home() / ".claude" / "council-cache" / "instrumentation-query.jsonl"
+_QUERY_INST_CAP_BYTES = 10 * 1024 * 1024
+
+
+def _emit_query_instrumentation(record: dict) -> None:
+    """Append one per-query JSONL record with 10 MB tail-truncate at write time."""
+    try:
+        path = _QUERY_INST_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > _QUERY_INST_CAP_BYTES:
+            data = path.read_bytes()[-(8 * 1024 * 1024):]
+            first_nl = data.find(b"\n")
+            if first_nl > 0:
+                data = data[first_nl + 1:]
+            path.write_bytes(data)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def _is_reasoning_trail_only(text: str) -> bool:
     """Heuristic: response contains only Perplexity's pre-synthesis thought bubbles.
 
@@ -653,6 +678,9 @@ class PerplexityCouncil:
         # entirely — every research call uses the keeper's exact browser fingerprint.
         if await self._start_via_cdp():
             _log("CDP-attached to session_keeper; skipping local browser launch")
+            if hasattr(self, "_query_inst"):
+                self._query_inst["chrome_path_used"] = "cdp_attached"
+                self._query_inst["cdp_keeper_alive_at_start"] = True
             return
 
         if self.headless_fallback and self.headless:
@@ -852,6 +880,8 @@ class PerplexityCouncil:
         fp = self._get_instance_fingerprint(self.instance_id)
         vp_w, vp_h = fp["viewport"]
         _log(f"Non-persistent: instance={self.instance_id} profile={self._temp_profile_dir} viewport={vp_w}x{vp_h}")
+        if hasattr(self, "_query_inst"):
+            self._query_inst["chrome_path_used"] = "local_nonpersistent"
 
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self._temp_profile_dir,
@@ -873,6 +903,8 @@ class PerplexityCouncil:
         Always uses instance_id=0 (login sessions don't need fingerprint diversification).
         """
         BROWSER_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if hasattr(self, "_query_inst"):
+            self._query_inst["chrome_path_used"] = "local_persistent"
 
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_USER_DATA_DIR),
@@ -2489,9 +2521,14 @@ class PerplexityCouncil:
                 if _is_reasoning_trail_only(text):
                     _log(f"WARNING: extracted text appears reasoning-trail-only ({len(text)} chars) — treating as empty for clean retry-once")
                     results["synthesis"] = ""
+                    if hasattr(self, "_query_inst"):
+                        self._query_inst["reasoning_trail_detection"] = "flagged_blanked"
+                        self._query_inst["extracted_synthesis_chars"] = 0
                 else:
                     results["synthesis"] = text
                     _log(f"Extracted research report: {len(results['synthesis'])} chars")
+                    if hasattr(self, "_query_inst"):
+                        self._query_inst["extracted_synthesis_chars"] = len(text)
             except Exception as e:
                 _log(f"WARNING: Failed to extract research report: {e}")
         else:
@@ -2598,10 +2635,38 @@ class PerplexityCouncil:
         self._init_artifact_dir(query)
         self._semaphore = SessionSemaphore()
 
+        # Phase 3 (2026-05-29 follow-ups) — initialize per-query instrumentation
+        # BEFORE _semaphore.acquire() so even the BrowserBusyError early-exit
+        # produces a record with chrome_path_used="cdp_busy". Step 7 critique Q3:
+        # the high-value cdp_busy signal would be lost if init waited until
+        # after the semaphore. Hook sites mutate self._query_inst along the way;
+        # emit happens at every exit path (early returns + bottom finally).
+        self._query_inst: dict = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "query_chars": len(query) if query else 0,
+            "perplexity_mode": getattr(self, "perplexity_mode", None),
+            "chrome_path_used": None,
+            "chrome_headless": bool(getattr(self, "headless", True)),
+            "cdp_keeper_alive_at_start": None,
+            "cookies_stale_critical": [],
+            "auto_refresh_path": "none",
+            "synthesis_mount_wait_outcome": "not_triggered",
+            "reasoning_trail_detection": "not_flagged",
+            "extracted_synthesis_chars": 0,
+            "exit_reason": None,
+            "inst_emitted": False,
+        }
+        self._query_inst_emitted = False
+
         try:
             instance_id = self._semaphore.acquire(SEMAPHORE_WAIT_TIMEOUT)
             self.instance_id = instance_id
         except BrowserBusyError as e:
+            self._query_inst["chrome_path_used"] = "cdp_busy"
+            self._query_inst["exit_reason"] = "browser_busy"
+            if not self._query_inst_emitted:
+                _emit_query_instrumentation(self._query_inst)
+                self._query_inst_emitted = True
             return {
                 "error": str(e),
                 "code": "BROWSER_BUSY",
@@ -2625,6 +2690,10 @@ class PerplexityCouncil:
             submit_lock = await self._acquire_submit_lock()
         except Exception as lock_err:
             self._semaphore.release()
+            self._query_inst["exit_reason"] = f"submit_lock_failed:{type(lock_err).__name__}"
+            if not self._query_inst_emitted:
+                _emit_query_instrumentation(self._query_inst)
+                self._query_inst_emitted = True
             return {
                 "error": f"submit_lock acquire failed: {lock_err!r}",
                 "step": "submit_lock",
@@ -2763,6 +2832,17 @@ class PerplexityCouncil:
                 try:
                     submit_lock.release()
                     _log("submit_lock released (defensive)")
+                except Exception:
+                    pass
+            # Phase 3 (2026-05-29): emit per-query instrumentation once per
+            # run() invocation regardless of exit path (normal return, raised
+            # exception, mid-pipeline failure). Idempotent via _query_inst_emitted.
+            if not getattr(self, "_query_inst_emitted", False):
+                try:
+                    if self._query_inst.get("exit_reason") is None:
+                        self._query_inst["exit_reason"] = "completed"
+                    _emit_query_instrumentation(self._query_inst)
+                    self._query_inst_emitted = True
                 except Exception:
                     pass
             # Guard: _semaphore may have been released + nulled earlier in this

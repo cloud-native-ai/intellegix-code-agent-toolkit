@@ -101,14 +101,24 @@ def _emit_pass_instrumentation(workdir: Path, record: dict) -> None:
     _append_instrumentation_jsonl(INSTRUMENTATION_GLOBAL_LOG, record)
 
 
-# Lowered 2026-05-27 from 8000 -> 3500 (~14 KB chars). Then revised 2026-05-29
-# to 5000 (~20 KB) per /extended-research audit verdict STRUCTURAL-UNRESOLVABLE:
-# the 3500 value was extrapolated from ONE 65 KB failure and likely under-utilized
-# Perplexity's true capacity. 5000 sits AT the documented ~20 KB browser-UI cliff
-# but Phase 1 instrumentation (instrumentation.jsonl) measures render-miss events
-# per run, enabling future data-driven adjustment.
-# INTERIM PENDING PHASE 4 CALIBRATION — do not treat as final value.
-ARTIFACT_TEXT_TOKEN_CAP = 5000          # max tokens for {{ARTIFACT_TEXT}} injection
+# 2026-05-29 14:30 PT data-driven revert 5000 -> 3500. Same-day instrumentation
+# (commits d90e4cf + 49fdaab) captured 26 queries / 21 passes in ~5 hours after
+# the 3500 -> 5000 relaxation landed. Empirical cliff observed at prompt > 18 KB:
+# successful extractions at qchars 14-17 KB returned 5-8 KB synthesis; failures
+# at qchars 18-24 KB returned 200-480 char partial-mount shells. The 5000-token
+# cap was pushing artifact text to ~20 KB which crossed the cliff once the
+# ~5 KB prompt scaffold was added.
+#
+# 3500 was the working pre-d90e4cf value; today's data confirms it's empirically
+# safe (caps artifact text at ~14 KB, prompts at ~19 KB max). See issue #44
+# comment 4579954481 for the cliff localization data:
+#   https://github.com/intellegix/intellegix-code-agent-toolkit/issues/44#issuecomment-4579954481
+#
+# Phase 4 may later support raising to 4000 once 20+ runs accumulate, but the
+# 5000 value is empirically wrong. The Phase 4 trigger threshold (20-run minimum
+# before adjustment) assumed slow calibration; the day-1 signal was loud enough
+# to enact the data-driven adjustment immediately.
+ARTIFACT_TEXT_TOKEN_CAP = 3500          # max tokens for {{ARTIFACT_TEXT}} injection
 FRESH_OBSERVER_SUMMARY_CAP = 2000       # Claude-generated summary cap
 FRESH_OBSERVER_TOTAL_CAP = 4000         # summary + finding titles list combined
 FRESH_OBSERVER_SCHEDULE = (8, 14, 20)   # pass numbers (and every 6 after)

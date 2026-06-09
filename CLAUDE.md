@@ -12,7 +12,7 @@
 - AI/ML: Claude API, Perplexity, Ollama | DB: PostgreSQL, SQLite, Redis
 
 ## Commands
-`/research`, `/smart-plan`, `/fix-issue`, `/implement`, `/implement-perplexity`, `/review`, `/handoff`, `/mcp-setup`, `/browser-test`, `/mcp-deploy`, `/council-refine`, `/export-to-council`, `/council-extract`, `/cache-perplexity-session`, `/portfolio-status`, `/frontend-e2e`, `/solve-perplexity`, `/session-audit`, `/raken-perplexity`, `/raken-api` (Defined in `~/.claude/commands/*.md`)
+`/research`, `/smart-plan`, `/fix-issue`, `/implement`, `/implement-perplexity`, `/review`, `/handoff`, `/mcp-setup`, `/browser-test`, `/mcp-deploy`, `/council-refine`, `/export-to-council`, `/council-extract`, `/cache-perplexity-session`, `/portfolio-status`, `/frontend-e2e`, `/solve-perplexity`, `/session-audit`, `/raken-perplexity`, `/raken-api`, `/raken-help`, `/spreadsheet-audit`, `/xls-perplexity`, `/xls-raken-perplexity` (Defined in `~/.claude/commands/*.md`)
 
 ## Models
 opus (complex arch) | sonnet (code) | haiku (quick) | sonnet+web (research)
@@ -68,6 +68,67 @@ Protected branches (`master`, `main`) require PRs. **Never merge directly.** Alw
 3. If a check fails, investigate and fix (re-run if transient, fix code if real)
 4. Only after all checks pass: `gh pr merge <number> --merge`
 5. Never use `--admin` to bypass failed checks unless explicitly instructed
+
+## Uncertainty Routing (MANDATORY)
+
+When facing a decision branch, resolve it using this decision tree **before** asking the user or stalling. Designed + verified via two `/research-perplexity` passes 2026-06-08.
+
+### Step 1 — Check escape hatches (ALWAYS ask user, never Perplexity)
+- Auth, credentials, secrets, API keys, tokens in any form
+- Irreversible destructive operations (delete, drop, truncate, force-push to shared branches, schema migrations without rollback)
+- True personal preferences with no objective answer (naming not already documented, UX aesthetics, feature priority, budget/time tradeoffs)
+- User-private environment state (local paths, hostnames, env values, production system live state)
+- Anything that must be approved before it affects real data or money
+- Decisions whose correct answer depends on project-specific internal state Perplexity cannot observe (e.g., "singleton vs DI for this service given how the rest of THIS codebase is structured"). Route to Step 3 via a documented pattern if one exists; otherwise ask user.
+- **When in doubt about reversibility, treat as irreversible and ask.**
+
+### Step 2 — Route to `/research-perplexity` if ALL of these are true
+- ≥2 defensible options exist (both technically valid)
+- The wrong choice causes rework or maintenance cost
+- The answer exists in the world and Perplexity can retrieve it
+- Query is < 14 KB after context trimming (per the 2026-05-29 empirical render-cliff at ~18 KB)
+- **Pre-route check**: confirm NEITHER option contains an irreversible sub-step. If Option A or Option B has an irreversible operation embedded, fall back to Step 1 and ask the user about that sub-step first.
+
+**Query template:**
+
+```
+[ENVIRONMENT CONTEXT — READ FIRST]
+... standard preamble ...
+[END ENVIRONMENT CONTEXT]
+
+Context: [2-3 sentences of relevant project context]
+Options: A) [option A] | B) [option B]
+Constraints: [actual constraints — latency, atomicity, disk, reversibility]
+Q: Which is more appropriate? Give a single recommendation with reasoning.
+```
+
+Use Perplexity's recommendation directly. If Perplexity hedges ("both are fine"), treat as trivial → Step 3.
+
+### Step 3 — Just decide
+- One clearly correct answer (import missing → add it)
+- Style/naming with no downstream consequence
+- Decision already documented in CLAUDE.md or MEMORY.md
+- Decision is fully reversible in under 5 minutes with no downstream side effects (try it, revert if wrong)
+- Uncertainty is only about Perplexity query phrasing (craft it, send it — don't re-route)
+- Perplexity unavailable (see fallback below)
+
+**Misclassification guard (BLOCKING per Step 7 critique R4)**: when taking a Step 3 decision with any doubt, log one line to task output (stdout, NOT a buried comment):
+
+```
+[STEP3] <choice made> — because: <one of: obvious-correct | style-only | documented | reversible-5min | pplx-query-phrasing | pplx-unavail>
+```
+
+If you cannot fill the `because` field with one of those exact tags without hedging, you are in Step 2, not Step 3.
+
+### Perplexity Fallback Chain
+1. Runner returns empty / timeout / reasoning-trail-only →
+   - Reversible decision: **just decide**, log `[PPLX-UNAVAIL] applied default: <choice>` to task output
+   - Irreversible decision: **ask user**
+2. Runner returns off-topic garbage (response doesn't name either option): treat as empty
+3. Runner returns confident recommendation that **contradicts** a constraint explicitly stated in CLAUDE.md or MEMORY.md: treat as garbage, apply fallback
+4. **No second Perplexity attempt** — the runner's internal retry-once already fired
+
+*Cross-ref: `MEMORY.md` §"Uncertainty Routing"*
 
 ## Agent Behavior
 - Before changes: read files first, understand context; Bugs: failing test first; Features: types/interfaces first; Refactors: tests pass before AND after
@@ -203,6 +264,9 @@ Respect the project's "DO NOT" list. Phase restrictions are hard limits, not sug
 ## Hooks
 Auto-format on save: Python (`black`+`isort`), TS/JS (`eslint --fix`), JSON/YAML/MD (`prettier --write`). Configure in `~/.claude/settings.json`.
 Activate add-ons in projects: reference `~/.claude/CLAUDE.md` add-on section, or copy to project CLAUDE.md.
+
+## Help-Hub
+Help-hub at <https://help-hub.fly.dev> (source: `~/.claude/help-hub/`). Embed snippet per `~/.claude/help-hub/SNIPPET.md`: `<script defer src="https://help-hub.fly.dev/widget.js" data-app="<app-name>"></script>`. Issues triage in the deployment-monitor's Issues tab at `http://127.0.0.1:8770/`. Email path: `intellegix.help@gmail.com`. Notifications: Pushover (cclaude app) + email to intellegix@gmail.com + akidwell@asr-inc.us.
 
 ## Troubleshooting
 **Failure → escalation ladder** (see "Failure Escalation via Research" in Agent Behavior): Tier 0 self-check → Tier 1 memory → Tier 2 `/research-perplexity` → Tier 2.5 `/solve-perplexity` → Tier 3 user handoff.

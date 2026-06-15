@@ -268,3 +268,15 @@ def test_stale_older_than_hours_zero_counts_all_past_rows(tmp_path):
     out = json.loads(r.stdout)
     assert out["op"] == "stale"
     assert out["stale"] == 3
+
+
+def test_connections_sqlite_returns_na_note(tmp_path):
+    # Connection-saturation preflight is a Postgres concept; sqlite has no
+    # server connection pool to saturate, so the op returns an n/a note rather
+    # than erroring.
+    db = _make_db(tmp_path)
+    r = _run(["--engine", "sqlite", "--db", str(db), "--op", "connections"])
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["op"] == "connections"
+    assert out["note"] == "n/a for sqlite"

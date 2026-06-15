@@ -371,3 +371,91 @@ def test_pg_audit_velocity_rejects_zero_threshold(monkeypatch):
                       window_seconds=60, threshold=0)
     with pytest.raises(SystemExit):
         _run_op(monkeypatch, args)
+
+
+# --- rowcount: reltuples-based approximate path (NEVER auto-COUNT) ------------
+#
+# The recording cursor returns (0,) for every fetchone(). For the approximate
+# rowcount path that means: n_live_tup -> 0 (not > 0), reltuples -> 0
+# (not > 0), so the op lands in the "unanalyzed" branch and — critically —
+# emits NO COUNT(*) statement. This is the busy-prod safety guarantee.
+
+def test_pg_rowcount_approximate_never_runs_count(monkeypatch):
+    args = _base_args(op="rowcount", table="orders")  # exact defaults False
+    fake_conn, result = _run_op(monkeypatch, args)
+    sqls = _executed_sql(fake_conn)
+    joined = " | ".join(sqls).lower()
+    # Approximate path consults the stats catalogs...
+    assert "pg_stat_user_tables" in joined
+    assert "pg_class" in joined
+    assert "reltuples" in joined
+    # ...and must NEVER emit a COUNT(*) on the approximate path.
+    assert "count(" not in joined, f"approximate rowcount ran COUNT: {sqls!r}"
+    # Read-only setup ran before the stats query.
+    stats_sql = next(s for s in sqls if "pg_stat_user_tables" in s.lower())
+    assert _read_only_setup_ran_before(fake_conn, stats_sql)
+    # With the recording cursor returning 0 for both stats, we land in the
+    # unanalyzed branch: count is None, approximate True, source "unanalyzed".
+    assert result.get("table") == "orders"
+    assert result["count"] is None
+    assert result["approximate"] is True
+    assert result["source"] == "unanalyzed"
+
+
+def test_pg_rowcount_binds_table_name_as_param(monkeypatch):
+    """The table name is bound as a PARAM to the stats queries, never
+    interpolated as an identifier."""
+    args = _base_args(op="rowcount", table="orders")
+    fake_conn, _ = _run_op(monkeypatch, args)
+    stats_stmts = [(sql, params) for sql, params in fake_conn.executed
+                   if "pg_stat_user_tables" in sql.lower()
+                   or ("pg_class" in sql.lower() and "reltuples" in sql.lower())]
+    assert stats_stmts, "no stats query found"
+    for sql, params in stats_stmts:
+        assert "%s" in sql
+        assert params == ("orders",)
+
+
+def test_pg_rowcount_exact_runs_count(monkeypatch):
+    args = _base_args(op="rowcount", table="orders", exact=True)
+    fake_conn, result = _run_op(monkeypatch, args)
+    joined = " | ".join(_executed_sql(fake_conn)).lower()
+    # --exact is the ONLY path that runs COUNT(*).
+    assert "count(" in joined
+    assert '"orders"' in " | ".join(_executed_sql(fake_conn))
+    assert result["approximate"] is False
+    assert result["source"] == "exact"
+    assert result["count"] == 0  # recording cursor returns (0,)
+
+
+# --- connections: pool-saturation preflight ----------------------------------
+
+def test_pg_connections_queries_activity_and_max(monkeypatch):
+    args = _base_args(op="connections")
+    fake_conn, result = _run_op(monkeypatch, args)
+    joined = " | ".join(_executed_sql(fake_conn)).lower()
+    assert "pg_stat_activity" in joined
+    assert "max_connections" in joined
+    # Runs under the read-only txn setup.
+    act_sql = next(s for s in _executed_sql(fake_conn)
+                   if "pg_stat_activity" in s.lower())
+    assert _read_only_setup_ran_before(fake_conn, act_sql)
+    # Recording cursor returns (0,) for both -> current 0, max 0, available 0.
+    assert result["op"] == "connections"
+    assert result["current"] == 0
+    assert result["max"] == 0
+    assert result["available"] == 0
+
+
+# --- read-only txn setup includes search_path + 3s statement_timeout ----------
+
+def test_pg_read_only_setup_sets_search_path_and_3s_timeout(monkeypatch):
+    args = _base_args(op="connections")
+    fake_conn, _ = _run_op(monkeypatch, args)
+    joined = " | ".join(_executed_sql(fake_conn)).lower()
+    # search_path scoped to the read-only txn so Supabase extension funcs resolve.
+    assert "set local search_path" in joined
+    assert "public" in joined and "extensions" in joined
+    # statement_timeout tightened to 3s (busy-prod safety margin).
+    assert "set local statement_timeout = '3s'" in joined
+    assert "set local work_mem = '4mb'" in joined

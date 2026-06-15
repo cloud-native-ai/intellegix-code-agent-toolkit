@@ -44,6 +44,37 @@ def test_readonly_role_contains_required_statements():
     assert '"public"' in sql
 
 
+def test_readonly_role_grants_pg_read_all_data_with_rls_note():
+    """PG14+ path: grant the built-in pg_read_all_data role with an RLS-bypass
+    comment so an audit role sees all rows (RLS would otherwise hide them)."""
+    sql = gen_readonly_role()
+    low = sql.lower()
+    # The preferred PG14+ grant.
+    assert "grant pg_read_all_data" in low
+    # RLS-bypass note (preferred path bypasses RLS).
+    assert "bypasses rls" in low
+    # Fallback path is explicitly called out as NOT bypassing RLS.
+    assert "do not bypass rls" in low or "not bypass rls" in low
+    assert "postgresql < 14" in low or "pg < 14" in low or "< 14" in low
+
+
+def test_readonly_role_creates_role_with_placeholder_password():
+    """CREATE ROLE must include a LOGIN PASSWORD placeholder the operator
+    is forced to change before running the script."""
+    sql = gen_readonly_role()
+    assert "CREATE ROLE" in sql
+    assert "LOGIN PASSWORD 'CHANGE_ME_BEFORE_RUNNING'" in sql
+
+
+def test_readonly_role_keeps_pg13_fallback_grants():
+    """The PG<14 fallback explicit read grants must still be present alongside
+    the pg_read_all_data grant."""
+    low = gen_readonly_role().lower()
+    assert 'grant usage on schema "public"' in low
+    assert 'grant select on all tables in schema "public"' in low
+    assert 'alter default privileges in schema "public"' in low
+
+
 def test_readonly_role_is_idempotent_do_block():
     sql = gen_readonly_role()
     low = sql.lower()

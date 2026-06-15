@@ -466,6 +466,10 @@ def _handle_sqlite(args: argparse.Namespace) -> dict[str, Any]:
                 _fail("--table is required for --op rowcount",
                       error_obj={"error": "--table is required for rowcount"})
             return _sqlite_rowcount(con, args.table)
+        if args.op == "connections":
+            # Connection-saturation preflight is a Postgres concept; SQLite has
+            # no server connection pool to saturate.
+            return {"op": "connections", "note": "n/a for sqlite"}
         if args.op == "fk_orphans":
             return _sqlite_fk_orphans(con, args.child, args.column,
                                       args.parent, args.parent_column)
@@ -553,10 +557,23 @@ def _pg_writable_role(conn: Any) -> bool:
 
 
 def _pg_rowcount(conn: Any, table: str, exact: bool) -> dict[str, Any]:
-    """Row count for a Postgres table.
+    """Row count for a Postgres table — NEVER auto-runs COUNT(*) on the approx path.
 
-    Default: fast approximate count from ``pg_stat_user_tables`` (bound param).
-    With ``exact``: ``SELECT COUNT(*)`` on the identifier-validated, quoted table.
+    Default (approximate) path, in order:
+      1. ``n_live_tup`` from ``pg_stat_user_tables`` (bound param). If present and
+         > 0, use it (``source = "n_live_tup"``).
+      2. Fall back to ``reltuples`` from ``pg_class`` (bound by relname). If
+         ``reltuples`` is a valid positive estimate, use it
+         (``source = "reltuples"``).
+      3. If the table was never analyzed (``reltuples`` is ``-1`` or ``0``, and
+         ``n_live_tup`` was NULL/0), DO NOT run ``COUNT(*)`` — return
+         ``count = None`` with ``source = "unanalyzed"`` and a note steering the
+         user to ANALYZE or ``--exact``. This protects the busiest prod DB from a
+         surprise full sequential scan on first contact.
+
+    With ``exact``: ``SELECT COUNT(*)`` on the identifier-validated, quoted table
+    (``source = "exact"``, ``approximate = False``). This is the ONLY path that
+    runs COUNT(*).
     """
     if not is_valid_identifier(table):
         _fail(f"invalid identifier: {table!r}",
@@ -564,24 +581,54 @@ def _pg_rowcount(conn: Any, table: str, exact: bool) -> dict[str, Any]:
 
     if exact:
         # table is identifier-validated; quote it defensively all the same.
+        # --exact is the ONLY path that runs COUNT(*).
         row = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()
-        count = int(row[0])
-        approximate = False
-    else:
-        row = conn.execute(
-            "SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = %s",
-            (table,),
-        ).fetchone()
-        if row is None or row[0] is None:
-            # No stats yet (fresh table / never analyzed) — fall back to exact.
-            row = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()
-            count = int(row[0])
-            approximate = False
-        else:
-            count = int(row[0])
-            approximate = True
+        return {"table": table, "count": int(row[0]), "approximate": False,
+                "source": "exact"}
 
-    return {"table": table, "count": count, "approximate": approximate}
+    # Approximate path 1: pg_stat_user_tables.n_live_tup (bound param).
+    row = conn.execute(
+        "SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = %s",
+        (table,),
+    ).fetchone()
+    if row is not None and row[0] is not None and int(row[0]) > 0:
+        return {"table": table, "count": int(row[0]), "approximate": True,
+                "source": "n_live_tup"}
+
+    # Approximate path 2: pg_class.reltuples (bound by relname). reltuples is a
+    # float estimate maintained by ANALYZE/VACUUM; -1 means "never analyzed"
+    # (PG14+), 0 can also mean never-analyzed on older versions or genuinely
+    # empty. We NEVER run COUNT(*) here regardless.
+    row = conn.execute(
+        "SELECT reltuples FROM pg_class WHERE relname = %s",
+        (table,),
+    ).fetchone()
+    if row is not None and row[0] is not None and float(row[0]) > 0:
+        return {"table": table, "count": int(float(row[0])), "approximate": True,
+                "source": "reltuples"}
+
+    # Path 3: never analyzed (reltuples == -1 or 0) AND no n_live_tup — do NOT
+    # scan. Report count unknown rather than risk a COUNT(*) on a busy prod table.
+    return {"table": table, "count": None, "approximate": True,
+            "source": "unanalyzed",
+            "note": "no statistics; run ANALYZE or use --exact"}
+
+
+def _pg_connections(conn: Any) -> dict[str, Any]:
+    """Connection-saturation snapshot for connection-pool preflight.
+
+    Returns ``{"op":"connections","current":N,"max":M,"available":M-N}`` where
+    ``current`` is the live backend count from ``pg_stat_activity`` and ``max``
+    is ``max_connections``. Aggregate-only (a single COUNT + a setting); runs
+    under the open READ ONLY transaction. Lets the command abort BEFORE the audit
+    if the busy prod DB is near connection saturation.
+    """
+    current = int(conn.execute(
+        "SELECT count(*) FROM pg_stat_activity").fetchone()[0])
+    maximum = int(conn.execute(
+        "SELECT current_setting('max_connections')::int").fetchone()[0])
+    return {"op": "connections", "current": current, "max": maximum,
+            "available": maximum - current}
 
 
 def _pg_raw(conn: Any, sql: str) -> dict[str, Any]:
@@ -876,8 +923,15 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
         # open read-only transaction, so they are scoped to the txn that runs
         # the user's query and survive transaction-mode poolers (which reset
         # session-level SETs between checkouts).
-        conn.execute("SET LOCAL statement_timeout = '5s'")
+        # statement_timeout tightened to 3s (from 5s) as a busy-app safety
+        # margin: on the busiest prod DB a runaway read must abort fast.
+        conn.execute("SET LOCAL statement_timeout = '3s'")
         conn.execute("SET LOCAL work_mem = '4MB'")
+
+        # Resolve Supabase extension functions (e.g. those living in the
+        # ``extensions`` schema) by putting it on the search_path. SET LOCAL so
+        # it is scoped to this read-only transaction only.
+        conn.execute("SET LOCAL search_path = public, extensions")
 
         read_only = _pg_read_only_flag(conn)
 
@@ -910,6 +964,8 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
                 _fail("--table is required for --op rowcount",
                       error_obj={"error": "--table is required for rowcount"})
             result = _pg_rowcount(conn, args.table, bool(args.exact))
+        elif args.op == "connections":
+            result = _pg_connections(conn)
         elif args.op == "fk_orphans":
             result = _pg_fk_orphans(conn, args.child, args.column,
                                     args.parent, args.parent_column)
@@ -972,8 +1028,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Connection string / path (CLI-only; never hardcoded).")
     parser.add_argument("--op", default=None,
                         help="Operation to run (e.g. schema, rowcount, "
-                             "fk_orphans, duplicates, null_drift, stale, "
-                             "audit_*). 'schema' lists tables/columns/FKs "
+                             "connections, fk_orphans, duplicates, null_drift, "
+                             "stale, audit_*). 'connections' reports current/max/"
+                             "available backends for a pool-saturation preflight "
+                             "(postgres; n/a for sqlite). 'schema' lists "
+                             "tables/columns/FKs "
                              "(read-only introspection; no HC_ALLOW_RAW "
                              "needed); optional --table scopes to one table.")
     parser.add_argument("--table", default=None,

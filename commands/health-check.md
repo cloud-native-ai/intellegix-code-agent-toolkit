@@ -108,10 +108,17 @@ Also read `vercel.json` and `render.yaml` for the deployed URL.
   prefer the paid/standard tier (not a free/preview service). Do not guess silently.
 - **`DATABASE_URL`:** from `--db` if provided; else parse `DATABASE_URL` from the
   priority-ordered `.env*`. If unresolved, P2/P3 DB checks are skipped with a noted reason.
-- **Supabase pooler vs direct:** if the DB host contains `pooler.supabase.com` or the port
-  is `6543`, this is a **transaction-mode pooler** connection. The read-only audit works fine
-  over the pooler, but note that **`--provision` DDL requires the DIRECT (non-pooler) URL**
-  (`hc_db.py` surfaces this as `"pooler": true` with a note).
+- **Supabase pooler vs direct — PREFER THE DIRECT CONNECTION.** Always prefer the **DIRECT**
+  connection (port `5432`, host `db.<project>.supabase.co`). If the resolved DSN is the
+  **pooler** (port `6543` or host containing `pooler.supabase.com`), this is a
+  **transaction-mode pooler**: session-level settings the audit relies on (`READ ONLY`,
+  `search_path`) may NOT persist across the pooler's per-statement connection reuse. **WARN**
+  the user and recommend switching to the direct URL. If the user insists on the pooler,
+  proceed — but still strictly read-only — and note the caveat in the report. **`--provision`
+  DDL ALWAYS requires the DIRECT (non-pooler) URL.** (`hc_db.py` surfaces pooler detection as
+  `"pooler": true` with a note.)
+- **TLS:** recommend `sslmode=require` on the DSN (append `?sslmode=require` if absent) so the
+  connection to a real production DB is encrypted.
 
 **NEVER print the password or full DSN.** When you reference the DB, show only the host
 (and redact credentials).
@@ -139,6 +146,34 @@ established), `writable_role` (advisory — whether the role *could* write), and
   **`READ ONLY` transaction is still the hard guarantee**, so the run remains safe.
 - For SQLite, the file is opened `mode=ro` (OS-level read-only); there is no writable-role
   concept.
+
+### P0.4.5 Connection-saturation preflight (Postgres — protect a real user's slot)
+
+Before touching the busy production DB, check how close it is to connection saturation with
+the dedicated `connections` op:
+
+```bash
+python ~/.claude/health-check/hc_db.py --engine postgres --db "<DATABASE_URL>" --op connections
+```
+
+Output: `{"op":"connections","current":N,"max":M,"available":M-N}` (under the READ ONLY txn).
+
+- **If `available < 5`: ABORT the run.** Do not risk taking the last connection slot away from
+  a real user on the busiest prod DB. Surface the current/max/available numbers in the gate and
+  recommend retrying **off-peak**.
+- Otherwise proceed. (SQLite returns `{"op":"connections","note":"n/a for sqlite"}` — no pool
+  to saturate; skip this gate for SQLite.)
+
+### P0.4.6 RLS sanity note (Postgres — make sure the audit can actually see rows)
+
+Recommend running the audit with a role that can read all rows — a `pg_read_all_data` role
+(PG14+, bypasses RLS) or the table owner. Row-Level Security can silently hide rows from an
+ordinary role, making a healthy DB look empty.
+
+After schema discovery (P2.1), **verify a known non-empty table reports rows** — its
+`n_live_tup`/`reltuples` (or `--exact` count) should be `> 0`. **If every table reads as
+empty, WARN that RLS may be hiding rows from the audit role** and recommend re-running with a
+`pg_read_all_data`/owner role (generate one via `--provision`).
 
 ### P0.5 Single confirmation prompt (the ONE gate)
 
@@ -254,7 +289,8 @@ object to stdout. Exact flag names and output keys:
 | Check | Command | Output keys |
 |-------|---------|-------------|
 | Schema | `--op schema` (add `--table <t>` to scope; **no `HC_ALLOW_RAW`**) | `{"op":"schema","tables":[{"table","columns":[{"name","type","notnull","pk"}],"foreign_keys":[{"column","ref_table","ref_column"}]}]}` |
-| Row count | `--op rowcount --table <t>` (add `--exact` on `--deep` / Postgres) | `{"table","count","approximate"}` (Postgres adds `approximate`; SQLite is always exact) |
+| Row count | `--op rowcount --table <t>` (add `--exact` only on `--deep`) | `{"table","count","approximate","source"}` (Postgres `source` ∈ `n_live_tup`\|`reltuples`\|`unanalyzed`\|`exact`; an unanalyzed table reports `count: null`; SQLite is always exact) |
+| Connections | `--op connections` | `{"op":"connections","current","max","available"}` (Postgres; `{"op":"connections","note":"n/a for sqlite"}` for SQLite) |
 | FK orphans | `--op fk_orphans --child <t> --column <fk> --parent <pt> --parent-column <pc>` | `{"op":"fk_orphans","child","column","parent","orphans"}` |
 | Duplicates | `--op duplicates --table <t> --column <unique_col>` | `{"op":"duplicates","table","column","duplicate_groups"}` |
 | NULL drift | `--op null_drift --table <t> --column <not_null_col>` | `{"op":"null_drift","table","column","nulls"}` |
@@ -268,11 +304,16 @@ Apply each to the right targets:
 - **stale** — on tables with a transitional/in-progress status (e.g. `status = 'processing'`
   / `'pending'`) using the row's age column.
 
-**Counts default to approximate** (Postgres `n_live_tup` estimate). With `--deep`, pass
-`--exact` to force `COUNT(*)` and full sequential scans — **recommend off-peak** because it is
-heavier. Every Postgres op runs inside the server-enforced `READ ONLY` transaction with
-`SET LOCAL statement_timeout = '5s'` and `SET LOCAL work_mem = '4MB'` already applied by
-`hc_db.py` — you do not set these yourself.
+**Counts default to approximate and NEVER auto-run `COUNT(*)`.** The Postgres approximate path
+reads `n_live_tup` (from `pg_stat_user_tables`) first, falls back to `pg_class.reltuples` if
+that is NULL/0, and — if the table was never analyzed (`reltuples` is `-1`/`0`) — reports
+`count: null` with `source: "unanalyzed"` **rather than scanning the table**. A full
+sequential `COUNT(*)` only ever runs on the explicit `--deep` / `--exact` path
+(`source: "exact"`) — **recommend off-peak** because it is heavier on the busiest prod DB.
+Every Postgres op runs inside the server-enforced `READ ONLY` transaction with
+`SET LOCAL statement_timeout = '3s'`, `SET LOCAL work_mem = '4MB'`, and
+`SET LOCAL search_path = public, extensions` already applied by `hc_db.py` — you do not set
+these yourself.
 
 ### P2.3 Row-count anomaly (baseline-before-record — CRITICAL ORDER)
 

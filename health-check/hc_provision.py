@@ -75,9 +75,12 @@ def gen_readonly_role(role: str = "healthcheck_ro", schema: str = "public") -> s
 
     The emitted script:
       * creates ``role`` idempotently via a ``DO $$ ... $$`` block that checks
-        ``pg_roles`` first (Postgres has no ``CREATE ROLE IF NOT EXISTS``);
-      * grants ``USAGE`` on ``schema`` and ``SELECT`` on all existing tables;
-      * sets ``ALTER DEFAULT PRIVILEGES`` so future tables also grant SELECT.
+        ``pg_roles`` first (Postgres has no ``CREATE ROLE IF NOT EXISTS``), with
+        a placeholder password the operator MUST change before running;
+      * grants the built-in ``pg_read_all_data`` role (PG14+) — this grants
+        SELECT on all tables AND bypasses RLS so audits see all rows;
+      * falls back, for PostgreSQL < 14, to explicit ``USAGE`` + ``SELECT`` +
+        ``ALTER DEFAULT PRIVILEGES`` grants (these do NOT bypass RLS).
 
     It contains NO write grants (no INSERT/UPDATE/DELETE/ALL PRIVILEGES).
 
@@ -95,19 +98,21 @@ def gen_readonly_role(role: str = "healthcheck_ro", schema: str = "public") -> s
     _require_identifier(schema, "schema")
 
     return f"""-- Least-privilege read-only role for /health-check.
--- Creates "{role}" (idempotent) and grants SELECT-only on schema "{schema}".
+-- Creates "{role}" (idempotent) and grants SELECT-only read access.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
-        CREATE ROLE "{role}" LOGIN;
+        CREATE ROLE "{role}" LOGIN PASSWORD 'CHANGE_ME_BEFORE_RUNNING';
     END IF;
 END
 $$;
 
+-- PG14+: pg_read_all_data grants SELECT on all tables AND bypasses RLS (audits see all rows). Preferred.
+GRANT pg_read_all_data TO "{role}";
+
+-- Fallback for PostgreSQL < 14 (no pg_read_all_data) — explicit read grants; NOTE: these do NOT bypass RLS:
 GRANT USAGE ON SCHEMA "{schema}" TO "{role}";
 GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}";
-
--- Cover tables created in the future, too.
 ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT ON TABLES TO "{role}";"""
 
 

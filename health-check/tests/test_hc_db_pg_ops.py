@@ -458,4 +458,6 @@ def test_pg_read_only_setup_sets_search_path_and_3s_timeout(monkeypatch):
     assert "public" in joined and "extensions" in joined
     # statement_timeout tightened to 3s (busy-prod safety margin).
     assert "set local statement_timeout = '3s'" in joined
+    # lock_timeout so reads fail fast instead of queueing behind a migration lock.
+    assert "set local lock_timeout = '500ms'" in joined
     assert "set local work_mem = '4mb'" in joined

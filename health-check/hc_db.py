@@ -926,6 +926,10 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
         # statement_timeout tightened to 3s (from 5s) as a busy-app safety
         # margin: on the busiest prod DB a runaway read must abort fast.
         conn.execute("SET LOCAL statement_timeout = '3s'")
+        # lock_timeout so a read that hits an in-flight ACCESS EXCLUSIVE lock
+        # (e.g. a migration / ALTER TABLE) fails fast instead of queueing behind
+        # it and stacking up behind real user queries on the busy DB.
+        conn.execute("SET LOCAL lock_timeout = '500ms'")
         conn.execute("SET LOCAL work_mem = '4MB'")
 
         # Resolve Supabase extension functions (e.g. those living in the

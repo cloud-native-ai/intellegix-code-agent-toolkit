@@ -1,5 +1,6 @@
 # tests/test_hc_db_safety.py
 import json, sqlite3, subprocess, sys, os
+import argparse
 import importlib.util
 import pytest
 
@@ -132,3 +133,78 @@ def test_is_safe_sql_rejects_pg_unsafe(sql):
 ])
 def test_is_safe_sql_allows_reads(sql):
     assert is_safe_sql(sql) is True, f"should allow: {sql}"
+
+
+# --- FIX 1 lock-in: postgres handler fails closed on non-READ-ONLY txn ---
+#
+# No live DB. We stub psycopg.connect to hand back a fake connection that
+# accepts the session/transaction SETs, then monkeypatch the module's
+# _pg_read_only_flag to report False (i.e. the READ ONLY txn did NOT take).
+# The handler MUST abort (SystemExit, non-zero) BEFORE running any user query,
+# and the emitted error must mention "read-only". This proves the fail-closed
+# precondition branch rather than merely reporting the flag.
+
+class _FakeCursor:
+    description = None
+
+    def fetchone(self):
+        return (0,)
+
+    def fetchall(self):
+        return []
+
+
+class _FakeConn:
+    """Minimal stand-in for a psycopg3 connection used by _handle_postgres."""
+
+    def __init__(self):
+        self.autocommit = True
+        self.rolled_back = False
+        self.closed = False
+        self.executed: list[str] = []
+
+    def execute(self, sql, params=None):
+        # If the handler ever reaches the user query after the read-only flag
+        # is False, this records it — the test asserts that never happens.
+        self.executed.append(sql)
+        return _FakeCursor()
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        self.closed = True
+
+
+def test_postgres_handler_fails_closed_when_not_read_only(monkeypatch, capsys):
+    import types
+
+    fake_conn = _FakeConn()
+    fake_psycopg = types.SimpleNamespace(
+        connect=lambda dsn: fake_conn,
+        Error=Exception,
+    )
+    # _handle_postgres does `import psycopg` lazily inside the function, so
+    # injecting it into sys.modules makes the lazy import resolve to our stub.
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    # Force the read-only precondition to fail.
+    monkeypatch.setattr(_hc_db, "_pg_read_only_flag", lambda conn: False)
+
+    args = argparse.Namespace(
+        engine="postgres", db="postgresql://x@localhost/db",
+        op="rowcount", table="a", raw=None, exact=False,
+        child=None, column=None, parent=None, parent_column=None,
+        value=None, age_column=None, older_than_hours=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _hc_db._handle_postgres(args)
+
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "read-only" in combined or "read only" in combined
+    # The user query must never have run after the precondition failed.
+    assert not any('from "a"' in s.lower() or "n_live_tup" in s.lower()
+                   for s in fake_conn.executed), fake_conn.executed
+    assert fake_conn.rolled_back is True

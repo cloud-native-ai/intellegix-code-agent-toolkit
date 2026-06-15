@@ -130,6 +130,32 @@ def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload))
 
 
+def _require_identifier(name: str | None, what: str) -> str:
+    """Validate ``name`` as an identifier or fail closed.
+
+    Returns the validated name so call sites read as ``t = _require_identifier(...)``.
+    ``what`` is the human label used in the error (e.g. ``--child``).
+    """
+    if not name:
+        _fail(f"{what} is required",
+              error_obj={"error": f"{what} is required"})
+    if not is_valid_identifier(name):
+        _fail(f"invalid identifier for {what}: {name!r}",
+              error_obj={"error": f"invalid identifier for {what}: {name}"})
+    return name
+
+
+def _require_non_negative_int(value: int | None, what: str) -> int:
+    """Validate ``value`` is a present, non-negative int or fail closed."""
+    if value is None:
+        _fail(f"{what} is required",
+              error_obj={"error": f"{what} is required"})
+    if value < 0:
+        _fail(f"{what} must be a non-negative integer (got {value})",
+              error_obj={"error": f"{what} must be a non-negative integer"})
+    return value
+
+
 # --- SQLite path ---------------------------------------------------------------
 
 def _connect_sqlite_ro(db: str) -> sqlite3.Connection:
@@ -159,6 +185,75 @@ def _sqlite_raw(con: sqlite3.Connection, sql: str) -> dict[str, Any]:
     return {"rows": [list(row) for row in rows]}
 
 
+def _sqlite_fk_orphans(con: sqlite3.Connection, child: str, column: str,
+                       parent: str, parent_column: str) -> dict[str, Any]:
+    """Count child rows whose ``column`` is set but has no matching parent row.
+
+    All four identifiers are validated + quoted; no values are interpolated.
+    """
+    child = _require_identifier(child, "--child")
+    column = _require_identifier(column, "--column")
+    parent = _require_identifier(parent, "--parent")
+    parent_column = _require_identifier(parent_column, "--parent-column")
+    sql = (
+        f'SELECT COUNT(*) FROM "{child}" ch '
+        f'WHERE ch."{column}" IS NOT NULL '
+        f'AND NOT EXISTS (SELECT 1 FROM "{parent}" p '
+        f'WHERE p."{parent_column}" = ch."{column}")'
+    )
+    count = int(con.execute(sql).fetchone()[0])
+    return {"op": "fk_orphans", "child": child, "column": column,
+            "parent": parent, "orphans": count}
+
+
+def _sqlite_duplicates(con: sqlite3.Connection, table: str,
+                       column: str) -> dict[str, Any]:
+    """Count value-groups in ``column`` (non-NULL) that occur more than once."""
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    sql = (
+        f'SELECT COUNT(*) FROM (SELECT "{column}" FROM "{table}" '
+        f'WHERE "{column}" IS NOT NULL GROUP BY "{column}" '
+        f'HAVING COUNT(*) > 1) d'
+    )
+    count = int(con.execute(sql).fetchone()[0])
+    return {"op": "duplicates", "table": table, "column": column,
+            "duplicate_groups": count}
+
+
+def _sqlite_null_drift(con: sqlite3.Connection, table: str,
+                       column: str) -> dict[str, Any]:
+    """Count rows where ``column`` IS NULL."""
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    sql = f'SELECT COUNT(*) FROM "{table}" WHERE "{column}" IS NULL'
+    count = int(con.execute(sql).fetchone()[0])
+    return {"op": "null_drift", "table": table, "column": column, "nulls": count}
+
+
+def _sqlite_stale(con: sqlite3.Connection, table: str, column: str, value: str,
+                  age_column: str, older_than_hours: int) -> dict[str, Any]:
+    """Count rows matching ``column = value`` whose ``age_column`` is older than H hours.
+
+    ``age_column`` is assumed to be a timestamp/text column comparable against
+    SQLite's ``datetime('now', ...)`` (ISO-8601 / SQLite datetime format). The
+    matched value is bound as a parameter; the relative interval string is built
+    from the validated integer H (no value interpolation of untrusted data).
+    """
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    age_column = _require_identifier(age_column, "--age-column")
+    hours = _require_non_negative_int(older_than_hours, "--older-than-hours")
+    sql = (
+        f'SELECT COUNT(*) FROM "{table}" '
+        f'WHERE "{column}" = ? AND "{age_column}" < datetime(\'now\', ?)'
+    )
+    interval = f"-{hours} hours"
+    count = int(con.execute(sql, (value, interval)).fetchone()[0])
+    return {"op": "stale", "table": table, "column": column, "value": value,
+            "stale": count}
+
+
 def _handle_sqlite(args: argparse.Namespace) -> dict[str, Any]:
     con = _connect_sqlite_ro(args.db)
     try:
@@ -169,6 +264,19 @@ def _handle_sqlite(args: argparse.Namespace) -> dict[str, Any]:
                 _fail("--table is required for --op rowcount",
                       error_obj={"error": "--table is required for rowcount"})
             return _sqlite_rowcount(con, args.table)
+        if args.op == "fk_orphans":
+            return _sqlite_fk_orphans(con, args.child, args.column,
+                                      args.parent, args.parent_column)
+        if args.op == "duplicates":
+            return _sqlite_duplicates(con, args.table, args.column)
+        if args.op == "null_drift":
+            return _sqlite_null_drift(con, args.table, args.column)
+        if args.op == "stale":
+            if args.value is None:
+                _fail("--value is required for --op stale",
+                      error_obj={"error": "--value is required for stale"})
+            return _sqlite_stale(con, args.table, args.column, args.value,
+                                 args.age_column, args.older_than_hours)
         _fail(f"unknown op: {args.op!r}",
               error_obj={"error": f"unknown op: {args.op}"})
     finally:
@@ -272,6 +380,69 @@ def _pg_raw(conn: Any, sql: str) -> dict[str, Any]:
     return {"rows": [list(row) for row in rows]}
 
 
+def _pg_fk_orphans(conn: Any, child: str, column: str, parent: str,
+                   parent_column: str) -> dict[str, Any]:
+    """Count child rows whose ``column`` is set but has no matching parent row."""
+    child = _require_identifier(child, "--child")
+    column = _require_identifier(column, "--column")
+    parent = _require_identifier(parent, "--parent")
+    parent_column = _require_identifier(parent_column, "--parent-column")
+    sql = (
+        f'SELECT COUNT(*) FROM "{child}" ch '
+        f'WHERE ch."{column}" IS NOT NULL '
+        f'AND NOT EXISTS (SELECT 1 FROM "{parent}" p '
+        f'WHERE p."{parent_column}" = ch."{column}")'
+    )
+    count = int(conn.execute(sql).fetchone()[0])
+    return {"op": "fk_orphans", "child": child, "column": column,
+            "parent": parent, "orphans": count}
+
+
+def _pg_duplicates(conn: Any, table: str, column: str) -> dict[str, Any]:
+    """Count value-groups in ``column`` (non-NULL) that occur more than once."""
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    sql = (
+        f'SELECT COUNT(*) FROM (SELECT "{column}" FROM "{table}" '
+        f'WHERE "{column}" IS NOT NULL GROUP BY "{column}" '
+        f'HAVING COUNT(*) > 1) d'
+    )
+    count = int(conn.execute(sql).fetchone()[0])
+    return {"op": "duplicates", "table": table, "column": column,
+            "duplicate_groups": count}
+
+
+def _pg_null_drift(conn: Any, table: str, column: str) -> dict[str, Any]:
+    """Count rows where ``column`` IS NULL."""
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    sql = f'SELECT COUNT(*) FROM "{table}" WHERE "{column}" IS NULL'
+    count = int(conn.execute(sql).fetchone()[0])
+    return {"op": "null_drift", "table": table, "column": column, "nulls": count}
+
+
+def _pg_stale(conn: Any, table: str, column: str, value: str, age_column: str,
+              older_than_hours: int) -> dict[str, Any]:
+    """Count rows matching ``column = value`` older than H hours.
+
+    ``age_column`` is assumed to be a timestamp/timestamptz column. The matched
+    value and the integer hour count are both bound as parameters; only the
+    validated identifiers are interpolated into the SQL text.
+    """
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    age_column = _require_identifier(age_column, "--age-column")
+    hours = _require_non_negative_int(older_than_hours, "--older-than-hours")
+    sql = (
+        f'SELECT COUNT(*) FROM "{table}" '
+        f'WHERE "{column}" = %s '
+        f'AND "{age_column}" < now() - make_interval(hours => %s)'
+    )
+    count = int(conn.execute(sql, (value, hours)).fetchone()[0])
+    return {"op": "stale", "table": table, "column": column, "value": value,
+            "stale": count}
+
+
 def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
     """Postgres read-only handler.
 
@@ -340,6 +511,19 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
                 _fail("--table is required for --op rowcount",
                       error_obj={"error": "--table is required for rowcount"})
             result = _pg_rowcount(conn, args.table, bool(args.exact))
+        elif args.op == "fk_orphans":
+            result = _pg_fk_orphans(conn, args.child, args.column,
+                                    args.parent, args.parent_column)
+        elif args.op == "duplicates":
+            result = _pg_duplicates(conn, args.table, args.column)
+        elif args.op == "null_drift":
+            result = _pg_null_drift(conn, args.table, args.column)
+        elif args.op == "stale":
+            if args.value is None:
+                _fail("--value is required for --op stale",
+                      error_obj={"error": "--value is required for stale"})
+            result = _pg_stale(conn, args.table, args.column, args.value,
+                               args.age_column, args.older_than_hours)
         else:
             _fail(f"unknown op: {args.op!r}",
                   error_obj={"error": f"unknown op: {args.op}"})
@@ -380,6 +564,25 @@ def build_parser() -> argparse.ArgumentParser:
                              "fk_orphans, duplicates, audit_*.")
     parser.add_argument("--table", default=None,
                         help="Table identifier for table-scoped ops.")
+    parser.add_argument("--child", default=None,
+                        help="Child table identifier (fk_orphans).")
+    parser.add_argument("--column", default=None,
+                        help="Column identifier for column-scoped ops "
+                             "(duplicates, null_drift, fk_orphans child column, "
+                             "stale match column).")
+    parser.add_argument("--parent", default=None,
+                        help="Parent table identifier (fk_orphans).")
+    parser.add_argument("--parent-column", default=None,
+                        help="Parent column identifier referenced by the child "
+                             "column (fk_orphans).")
+    parser.add_argument("--value", default=None,
+                        help="Data value to match (stale). Bound as a parameter; "
+                             "NOT validated as an identifier.")
+    parser.add_argument("--age-column", default=None,
+                        help="Timestamp column to age-compare (stale).")
+    parser.add_argument("--older-than-hours", type=int, default=None,
+                        help="Age threshold in hours for the stale op. Must be a "
+                             "non-negative integer.")
     parser.add_argument("--raw", default=None,
                         help="Raw SQL escape hatch. Still SELECT-only guarded.")
     parser.add_argument("--exact", action="store_true",

@@ -44,11 +44,12 @@ def test_readonly_role_contains_required_statements():
     assert '"public"' in sql
 
 
-def test_readonly_role_grants_pg_read_all_data_with_bypassrls():
-    """PG14+ path: grant pg_read_all_data AND ALTER ROLE ... WITH BYPASSRLS so
-    the audit sees RLS-protected rows. pg_read_all_data alone does NOT bypass
-    RLS, so without BYPASSRLS a Supabase audit role would read zero rows."""
-    sql = gen_readonly_role()
+def test_readonly_role_supabase_grants_pg_read_all_data_with_bypassrls():
+    """Supabase platform: grant pg_read_all_data AND ALTER ROLE ... WITH
+    BYPASSRLS so the audit sees RLS-protected rows. pg_read_all_data alone does
+    NOT bypass RLS, so without BYPASSRLS a Supabase audit role would read zero
+    rows. The PG<14 fallback explicit grants must also be present."""
+    sql = gen_readonly_role(platform="supabase")
     low = sql.lower()
     # The preferred PG14+ grant.
     assert "grant pg_read_all_data" in low
@@ -57,41 +58,67 @@ def test_readonly_role_grants_pg_read_all_data_with_bypassrls():
     # The comment must NOT falsely claim pg_read_all_data bypasses RLS.
     assert "does not bypass rls" in low or "not bypass rls" in low
     assert "postgresql < 14" in low or "pg < 14" in low or "< 14" in low
-
-
-def test_readonly_role_creates_role_with_placeholder_password():
-    """CREATE ROLE must include a LOGIN PASSWORD placeholder the operator
-    is forced to change before running the script."""
-    sql = gen_readonly_role()
-    assert "CREATE ROLE" in sql
-    assert "LOGIN PASSWORD 'CHANGE_ME_BEFORE_RUNNING'" in sql
-
-
-def test_readonly_role_keeps_pg13_fallback_grants():
-    """The PG<14 fallback explicit read grants must still be present alongside
-    the pg_read_all_data grant."""
-    low = gen_readonly_role().lower()
+    # Fallback explicit grants present alongside the privileged path.
     assert 'grant usage on schema "public"' in low
     assert 'grant select on all tables in schema "public"' in low
     assert 'alter default privileges in schema "public"' in low
 
 
+def test_readonly_role_default_and_render_are_portable_no_bypassrls():
+    """BUG FIX: the default (generic) and render paths must be portable for a
+    non-superuser owner — explicit GRANT SELECT, and ABSOLUTELY no
+    pg_read_all_data / BYPASSRLS (those require superuser and FAIL on Render)."""
+    for sql in (gen_readonly_role(), gen_readonly_role(platform="render")):
+        low = sql.lower()
+        assert "grant select on all tables" in low
+        assert "alter default privileges" in low
+        assert "grant usage on schema" in low
+        # The bug fix: these privileged statements must be ABSENT. The tokens may
+        # appear ONLY inside the negating explanatory comment ("no pg_read_all_data
+        # / bypassrls ..."), never on an actual SQL (non-comment) line.
+        sql_lines = [
+            ln for ln in low.splitlines() if not ln.lstrip().startswith("--")
+        ]
+        sql_body = "\n".join(sql_lines)
+        assert "bypassrls" not in sql_body
+        assert "pg_read_all_data" not in sql_body
+        # And no executable GRANT/ALTER statement form for either privileged path.
+        assert "grant pg_read_all_data" not in low
+        assert "with bypassrls" not in low
+
+
+def test_readonly_role_database_emits_grant_connect():
+    """When a database name is given on the portable path, emit GRANT CONNECT."""
+    sql = gen_readonly_role(database="asr_po_system")
+    assert 'grant connect on database "asr_po_system"' in sql.lower()
+
+
+def test_readonly_role_creates_role_with_placeholder_password():
+    """CREATE ROLE must include a LOGIN PASSWORD placeholder the operator
+    is forced to change before running the script (both platforms)."""
+    for sql in (gen_readonly_role(), gen_readonly_role(platform="supabase")):
+        assert "CREATE ROLE" in sql
+        assert "LOGIN PASSWORD 'CHANGE_ME_BEFORE_RUNNING'" in sql
+
+
 def test_readonly_role_is_idempotent_do_block():
-    sql = gen_readonly_role()
-    low = sql.lower()
-    # DO-block pattern that checks pg_roles before creating (no CREATE ROLE IF
-    # NOT EXISTS exists in Postgres).
-    assert "do $$" in low
-    assert "pg_roles" in low
+    for sql in (gen_readonly_role(), gen_readonly_role(platform="supabase")):
+        low = sql.lower()
+        # DO-block pattern that checks pg_roles before creating (no CREATE ROLE
+        # IF NOT EXISTS exists in Postgres).
+        assert "do $$" in low
+        assert "pg_roles" in low
 
 
 def test_readonly_role_has_no_write_grants():
-    sql = gen_readonly_role().lower()
-    assert "insert" not in sql
-    assert "update" not in sql
-    assert "delete" not in sql
-    assert "all privileges" not in sql
-    assert "grant all" not in sql
+    """No write grants on EITHER platform path."""
+    for sql in (gen_readonly_role(), gen_readonly_role(platform="supabase")):
+        low = sql.lower()
+        assert "insert" not in low
+        assert "update" not in low
+        assert "delete" not in low
+        assert "all privileges" not in low
+        assert "grant all" not in low
 
 
 def test_readonly_role_honors_custom_role_and_schema():
@@ -110,6 +137,11 @@ def test_readonly_role_rejects_injection_in_role():
 def test_readonly_role_rejects_injection_in_schema():
     with pytest.raises(ValueError):
         gen_readonly_role(schema='public"; DROP TABLE y; --')
+
+
+def test_readonly_role_rejects_injection_in_database():
+    with pytest.raises(ValueError):
+        gen_readonly_role(database='db"; DROP TABLE y; --')
 
 
 def test_readonly_role_rejects_empty_identifier():

@@ -472,8 +472,19 @@ When `--provision` is passed:
 1. **Enter plan mode.** Provisioning is a change-shaped action; present a plan, do not
    silently produce side effects beyond writing the reviewable file.
 2. Using `hc_provision.py`, generate the parts the health-check found missing:
-   - `gen_readonly_role(role="healthcheck_ro", schema="public")` — a least-privilege
-     SELECT-only role (no write grants), if no dedicated read-only role exists.
+   - `gen_readonly_role(role="healthcheck_ro", schema="public", platform=...)` — a
+     least-privilege SELECT-only role (no write grants), if no dedicated read-only role
+     exists. **The role SQL is chosen by detected platform:**
+     - **Supabase** → `platform="supabase"`: the `pg_read_all_data` + `ALTER ROLE ... WITH
+       BYPASSRLS` variant (RLS is on by default on Supabase, so the audit role needs
+       BYPASSRLS to read protected rows; pg_read_all_data alone does not bypass RLS). **Run
+       this in the Supabase dashboard SQL editor**, which executes as a privileged role.
+     - **Render / generic managed Postgres** → `platform="render"` (or the default
+       `"generic"`): the portable explicit-`GRANT SELECT` variant (`GRANT USAGE` + `GRANT
+       SELECT ON ALL TABLES` + `ALTER DEFAULT PRIVILEGES`). **No `BYPASSRLS` / no
+       `pg_read_all_data`** — those require a superuser and would FAIL for a non-superuser
+       DB owner (the typical Render connecting user); RLS is off by default there so neither
+       is needed. Pass `database="<db>"` to also emit `GRANT CONNECT ON DATABASE`.
    - `gen_audit_log_table(table="audit_log")` — an `audit_log` table with
      `id / user_id / action / ts / metadata` + supporting indexes, if no audit table exists.
 3. Write the concatenated script via

@@ -70,36 +70,65 @@ def _require_identifier(name: str, kind: str) -> str:
     return name
 
 
-def gen_readonly_role(role: str = "healthcheck_ro", schema: str = "public") -> str:
+def gen_readonly_role(
+    role: str = "healthcheck_ro",
+    schema: str = "public",
+    *,
+    platform: str = "generic",
+    database: str | None = None,
+) -> str:
     """Generate Postgres SQL creating a least-privilege read-only role.
 
-    The emitted script:
-      * creates ``role`` idempotently via a ``DO $$ ... $$`` block that checks
-        ``pg_roles`` first (Postgres has no ``CREATE ROLE IF NOT EXISTS``), with
-        a placeholder password the operator MUST change before running;
-      * grants the built-in ``pg_read_all_data`` role (PG14+) for SELECT on all
-        tables, then ``ALTER ROLE ... WITH BYPASSRLS`` so the audit can see
-        RLS-protected rows (pg_read_all_data alone does NOT bypass RLS; on
-        Supabase, RLS is on by default so without this the role reads 0 rows);
-      * falls back, for PostgreSQL < 14, to explicit ``USAGE`` + ``SELECT`` +
-        ``ALTER DEFAULT PRIVILEGES`` grants (also non-bypassing).
+    The emitted script is **platform-aware**, because privileged operations that
+    work on Supabase (run as a superuser in the dashboard SQL editor) FAIL on
+    Render / generic managed Postgres where the connecting user is a
+    non-superuser DB owner:
 
-    It contains NO write grants (no INSERT/UPDATE/DELETE/ALL PRIVILEGES).
+      * ``platform="generic"`` / ``"render"`` (the DEFAULT, portable path):
+        idempotent ``CREATE ROLE ... LOGIN``, optional ``GRANT CONNECT ON
+        DATABASE`` (if ``database`` given), then explicit ``GRANT USAGE`` +
+        ``GRANT SELECT ON ALL TABLES`` + ``ALTER DEFAULT PRIVILEGES ... GRANT
+        SELECT``. This is the least-privilege read-only path that any
+        non-superuser owner can run. It emits NO ``pg_read_all_data`` (needs
+        ADMIN OPTION on PG16+) and NO ``BYPASSRLS`` (needs superuser); RLS is
+        off by default outside Supabase so neither is required.
+
+      * ``platform="supabase"``: the privileged variant — ``CREATE ROLE``,
+        ``GRANT pg_read_all_data``, ``ALTER ROLE ... WITH BYPASSRLS`` (Supabase
+        turns RLS on by default, so the audit role NEEDS BYPASSRLS to read
+        protected rows; pg_read_all_data alone does NOT bypass RLS), PLUS the
+        explicit USAGE/SELECT/ALTER DEFAULT grants as a PG<14 fallback. Run this
+        in the Supabase dashboard SQL editor, which executes as a privileged
+        role.
+
+    Unknown ``platform`` values are treated as ``"generic"``.
+
+    It contains NO write grants (no INSERT/UPDATE/DELETE/ALL PRIVILEGES) on
+    either path.
 
     Args:
         role: Name of the read-only role to create. Validated + quoted.
         schema: Schema to grant read access on. Validated + quoted.
+        platform: Target platform — ``"generic"``, ``"render"`` (same as
+            generic), or ``"supabase"``. Unknown values fall back to generic.
+        database: Optional database name. If given on the generic/render path,
+            emits ``GRANT CONNECT ON DATABASE``. Validated + quoted.
 
     Returns:
         A Postgres SQL string (safe to write to a file for manual review).
 
     Raises:
-        ValueError: If ``role`` or ``schema`` is not a valid SQL identifier.
+        ValueError: If ``role``, ``schema``, or ``database`` is not a valid SQL
+            identifier.
     """
     _require_identifier(role, "role")
     _require_identifier(schema, "schema")
+    if database is not None:
+        _require_identifier(database, "database")
 
-    return f"""-- Least-privilege read-only role for /health-check.
+    if platform == "supabase":
+        return f"""-- Least-privilege read-only role for /health-check (Supabase variant).
+-- Run in the Supabase dashboard SQL editor (executes as a privileged role).
 -- Creates "{role}" (idempotent) and grants SELECT-only read access.
 DO $$
 BEGIN
@@ -118,6 +147,34 @@ GRANT pg_read_all_data TO "{role}";
 ALTER ROLE "{role}" WITH BYPASSRLS;
 
 -- Fallback for PostgreSQL < 14 (no pg_read_all_data) - explicit read grants; NOTE: these do NOT bypass RLS:
+GRANT USAGE ON SCHEMA "{schema}" TO "{role}";
+GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}";
+ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT ON TABLES TO "{role}";"""
+
+    # Default: generic / render (and any unknown platform). Portable, non-superuser-safe.
+    if database is not None:
+        connect_line = f'GRANT CONNECT ON DATABASE "{database}" TO "{role}";'
+    else:
+        connect_line = (
+            '-- GRANT CONNECT ON DATABASE "<your_db>" TO "'
+            f'{role}";  -- usually already granted to PUBLIC'
+        )
+
+    return f"""-- Least-privilege read-only role for /health-check (portable variant).
+-- Portable least-privilege read-only role. Works on Render/managed Postgres where the connecting user is a non-superuser owner. No pg_read_all_data / BYPASSRLS (those need superuser; RLS is off by default outside Supabase).
+-- Creates "{role}" (idempotent) and grants SELECT-only read access.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+        CREATE ROLE "{role}" LOGIN PASSWORD 'CHANGE_ME_BEFORE_RUNNING';
+    END IF;
+END
+$$;
+
+-- Allow the role to connect to the database (no-op if already granted to PUBLIC).
+{connect_line}
+
+-- Explicit least-privilege read grants (no superuser required):
 GRANT USAGE ON SCHEMA "{schema}" TO "{role}";
 GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}";
 ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT ON TABLES TO "{role}";"""

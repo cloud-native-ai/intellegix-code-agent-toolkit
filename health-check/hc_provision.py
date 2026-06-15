@@ -110,7 +110,7 @@ $$;
 -- PG14+: pg_read_all_data grants SELECT on all tables AND bypasses RLS (audits see all rows). Preferred.
 GRANT pg_read_all_data TO "{role}";
 
--- Fallback for PostgreSQL < 14 (no pg_read_all_data) — explicit read grants; NOTE: these do NOT bypass RLS:
+-- Fallback for PostgreSQL < 14 (no pg_read_all_data) - explicit read grants; NOTE: these do NOT bypass RLS:
 GRANT USAGE ON SCHEMA "{schema}" TO "{role}";
 GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}";
 ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT ON TABLES TO "{role}";"""
@@ -158,7 +158,7 @@ def _header(app: str | None) -> str:
     suffix = f" for {app}" if app else ""
     return (
         f"-- /health-check generated provisions{suffix}\n"
-        "-- REVIEW BEFORE RUNNING — never auto-applied.\n"
+        "-- REVIEW BEFORE RUNNING - never auto-applied.\n"
         "-- Apply manually against the DIRECT (non-pooler) connection with a "
         "superuser/owner role.\n"
         "-- Generated read-only; this script makes the MINIMUM changes for "

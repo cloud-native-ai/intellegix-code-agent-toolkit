@@ -297,6 +297,7 @@ object to stdout. Exact flag names and output keys:
 | Duplicates | `--op duplicates --table <t> --column <unique_col>` | `{"op":"duplicates","table","column","duplicate_groups"}` |
 | NULL drift | `--op null_drift --table <t> --column <not_null_col>` | `{"op":"null_drift","table","column","nulls"}` |
 | Stale rows | `--op stale --table <t> --column <status_col> --value <transitional> --age-column <ts_col> --older-than-hours <H>` | `{"op":"stale","table","column","value","stale"}` |
+| Value distribution | `--op value_distribution --table <t> --column <c> [--top <N>]` (N default 20; **filter-free — no WHERE**) | `{"op":"value_distribution","table","column","values":[{"value","n"}]}` (count-desc; NULL group included, serialized as JSON `null`) |
 
 Apply each to the right targets:
 
@@ -379,6 +380,7 @@ and record **"Sentinel not wired"** as a MISSING PROVISION (surfaced in P4 + act
 | Velocity bursts | `--op audit_velocity --table <audit> --user-column <uc> --ts-column <tc> --window-seconds <W> --threshold <N>` | `{"op":"audit_velocity","table","window_seconds","threshold","bursts":[{"user_id","count","bucket_start_epoch"}]}` |
 | Action fingerprint | `--op audit_fingerprint --table <audit> --user-column <uc> --action-column <ac>` | `{"op":"audit_fingerprint","table","users":[{"user_id","actions":{...}}]}` |
 | Recency + rate | `--op audit_recency --table <audit> --ts-column <tc>` | `{"op":"audit_recency","table","last_write_ts","events_24h","events_7d"}` |
+| Value distribution | `--op value_distribution --table <audit> --column <c> [--top <N>]` (N default 20; **filter-free**) | `{"op":"value_distribution","table","column","values":[{"value","n"}]}` (count-desc; NULL group included) |
 
 Use these to:
 
@@ -391,6 +393,41 @@ Use these to:
 - **Confirm logging coverage & error rate** (`audit_recency` — last write timestamp + 24h/7d
   event counts; a stale `last_write_ts` or a zeroed `events_24h` despite live frontend traffic
   is a coverage gap).
+- **Profile the event-type mix & flag session-balance asymmetry**
+  (`value_distribution --table audit_events --column event_type`): inspect the top event
+  types and **compare `session_start` vs `session_end` counts**. If they differ by more than
+  ~2× (in either direction), flag it as a **logging-coverage concern** — one side of the
+  session lifecycle is under-instrumented. (Live finding pattern: **351 `session_end` vs 83
+  `session_start`** — far more ends than starts means start events are being dropped or never
+  emitted.) Report the two counts and the ratio.
+
+### P3.3 Two-source audit model (frontend telemetry + data-change trail)
+
+`audit_events` is **frontend telemetry** (clicks / page events). It does NOT prove that
+**data mutations** are being captured. When the backend has a dedicated **data-change
+audit / approval table** — e.g. `po_approvals` with `actor` / `ip` / `timestamp` /
+`status_before` / `status_after` columns — run the audit ops against it **as a SECOND audit
+source**:
+
+```
+python health-check/hc_db.py --engine <e> --db <db> --op audit_user_summary \
+    --table po_approvals --user-column actor_user_id --action-column action
+python health-check/hc_db.py --engine <e> --db <db> --op audit_recency \
+    --table po_approvals --ts-column timestamp
+python health-check/hc_db.py --engine <e> --db <db> --op value_distribution \
+    --table po_approvals --column action
+```
+
+This makes the report answer **"is logging capturing data mutations, not just frontend
+clicks?"** Treat the two sources as complementary:
+
+- **Source 1 — frontend telemetry (`audit_events`):** what users *did in the UI*.
+- **Source 2 — data-change trail (`po_approvals` or equivalent):** what *actually changed in
+  the data*, with actor + IP + timestamp + before/after status.
+
+A healthy system shows activity in **both**. If `audit_events` is busy but the data-change
+table is stale/empty (or vice-versa), flag the gap: frontend-only logging misses silent data
+mutations; data-change-only logging misses user-intent context.
 
 > **SQLite timestamp note:** `audit_velocity` / `audit_recency` / `stale` on SQLite require
 > timestamps in canonical `YYYY-MM-DD HH:MM:SS` format (as produced by SQLite's `datetime()`).

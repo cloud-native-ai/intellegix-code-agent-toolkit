@@ -184,6 +184,85 @@ def test_audit_recency_empty_table_null_last_write(tmp_path):
     assert out["events_7d"] == 0
 
 
+# --- value_distribution -------------------------------------------------------
+
+def test_value_distribution_counts_order_and_null_group(tmp_path):
+    """Known frequencies (incl. a NULL group) come back in count-desc order."""
+    db = tmp_path / "dist.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE events(event_type TEXT)")
+    # frequencies: 'a' x5, 'b' x3, 'c' x1, NULL x2
+    rows = (["a"] * 5) + (["b"] * 3) + (["c"] * 1) + ([None] * 2)
+    con.executemany("INSERT INTO events(event_type) VALUES (?)",
+                    [(v,) for v in rows])
+    con.commit()
+    con.close()
+
+    r = _run(["--engine", "sqlite", "--db", str(db),
+              "--op", "value_distribution", "--table", "events",
+              "--column", "event_type"])
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["op"] == "value_distribution"
+    assert out["table"] == "events"
+    assert out["column"] == "event_type"
+    values = out["values"]
+    # Count-desc order.
+    counts = [v["n"] for v in values]
+    assert counts == sorted(counts, reverse=True)
+    # Map by value (NULL serializes to JSON null -> Python None key).
+    by_val = {v["value"]: v["n"] for v in values}
+    assert by_val["a"] == 5
+    assert by_val["b"] == 3
+    assert by_val["c"] == 1
+    # The NULL group is present and informative.
+    assert None in by_val
+    assert by_val[None] == 2
+    # Top value is 'a' (highest count).
+    assert values[0]["value"] == "a"
+    assert values[0]["n"] == 5
+
+
+def test_value_distribution_top_truncates(tmp_path):
+    """--top 2 returns only the two most-frequent groups."""
+    db = tmp_path / "dist2.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE events(event_type TEXT)")
+    rows = (["a"] * 5) + (["b"] * 3) + (["c"] * 1) + ([None] * 2)
+    con.executemany("INSERT INTO events(event_type) VALUES (?)",
+                    [(v,) for v in rows])
+    con.commit()
+    con.close()
+
+    r = _run(["--engine", "sqlite", "--db", str(db),
+              "--op", "value_distribution", "--table", "events",
+              "--column", "event_type", "--top", "2"])
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert len(out["values"]) == 2
+    # The two most frequent are 'a' (5) then 'b' (3).
+    assert [v["value"] for v in out["values"]] == ["a", "b"]
+    assert [v["n"] for v in out["values"]] == [5, 3]
+
+
+def test_value_distribution_rejects_bad_column(tmp_path):
+    db = _make_db(tmp_path)
+    r = _run(["--engine", "sqlite", "--db", str(db),
+              "--op", "value_distribution", "--table", "audit_log",
+              "--column", "x; DROP"])
+    assert r.returncode != 0
+    combined = (r.stdout + r.stderr).lower()
+    assert "identifier" in combined or "invalid" in combined
+
+
+def test_value_distribution_rejects_zero_top(tmp_path):
+    db = _make_db(tmp_path)
+    r = _run(["--engine", "sqlite", "--db", str(db),
+              "--op", "value_distribution", "--table", "audit_log",
+              "--column", "action", "--top", "0"])
+    assert r.returncode != 0
+
+
 # --- negative tests -----------------------------------------------------------
 
 def test_audit_user_summary_rejects_bad_user_column(tmp_path):

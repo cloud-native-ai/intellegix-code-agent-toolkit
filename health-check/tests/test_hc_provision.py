@@ -10,6 +10,7 @@ generated read-only role grants SELECT only (no write grants).
 """
 import importlib.util
 import os
+import subprocess
 import sys
 
 import pytest
@@ -174,7 +175,9 @@ def test_write_provision_sql_returns_path_type(tmp_path):
 # --------------------------------------------------------------------------- #
 # module never imports a DB driver / opens a connection
 # --------------------------------------------------------------------------- #
-def test_module_imports_no_db_driver():
+def test_module_imports_no_db_driver_source():
+    """Cheap source-text check (kept for fast feedback; runtime check below is
+    the authoritative one)."""
     src = open(
         os.path.join(_HC_DIR, "hc_provision.py"), encoding="utf-8"
     ).read().lower()
@@ -182,3 +185,29 @@ def test_module_imports_no_db_driver():
         assert forbidden not in src
     # no connection-opening calls
     assert ".connect(" not in src
+
+
+def test_module_imports_no_db_driver():
+    """Authoritative runtime check: import hc_provision in a FRESH interpreter
+    and assert no DB driver landed in sys.modules transitively.
+
+    The source-text grep above can give false confidence (e.g. importing a
+    module that itself imports sqlite3). This verifies the actual runtime
+    import graph instead.
+    """
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, r'{_HC_DIR}'); "
+        "import hc_provision; "
+        "bad = sorted(m for m in sys.modules "
+        "if m == 'sqlite3' or m.startswith(('psycopg', 'asyncpg', 'pg8000'))); "
+        "assert not bad, bad"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"DB driver leaked into sys.modules: {proc.stderr.strip()}"
+    )

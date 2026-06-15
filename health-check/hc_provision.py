@@ -6,14 +6,15 @@ health-check discovers missing infrastructure (no least-privilege read-only
 role, no ``audit_log`` table), this module GENERATES a reviewable ``.sql``
 script that the user applies manually.
 
-HARD GUARANTEE — this module NEVER connects to a database and NEVER executes
-SQL. It contains only pure string generators plus a file writer. No DB driver
-(psycopg / sqlite3 / asyncpg / ...) is imported anywhere, by design: there is
-no code path here that could touch a live database.
+HARD GUARANTEE — this module imports no database driver (psycopg / sqlite3 /
+asyncpg / ...) and never opens a database connection or executes SQL. It only
+generates SQL *text* via pure string builders and writes it to a file for
+manual review. There is no code path here that could touch a live database.
 
-Identifiers (role / schema / table names) are validated against the same strict
-regex used by ``hc_db.is_valid_identifier`` and quoted in the emitted SQL.
-Even though the output is written to a file rather than executed, identifier
+Identifiers (role / schema / table names) are validated with a self-contained
+strict regex (``^[A-Za-z_][A-Za-z0-9_]*$`` — the same rule
+``hc_db.is_valid_identifier`` enforces) and quoted in the emitted SQL. Even
+though the output is written to a file rather than executed, identifier
 injection-safety still matters: the file is meant to be run verbatim by a
 privileged role, so an unvalidated name could smuggle arbitrary SQL into the
 script a reviewer trusts.
@@ -21,46 +22,31 @@ script a reviewer trusts.
 
 from __future__ import annotations
 
-import importlib.util
 import os
+import re
 import tempfile
 from pathlib import Path
 
-# Reuse hc_db.is_valid_identifier as the single source of truth for identifier
-# validation. hc_db imports sqlite3 at module level; to keep the promise that
-# *this* module never imports a DB driver into its own namespace, we load only
-# the validator function by file location and bind it locally. If that import
-# fails for any reason, fall back to an identical local regex (documented below)
-# so the safety check is never silently skipped.
-_HC_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hc_db.py")
+# Self-contained identifier validator. This module deliberately does NOT import
+# hc_db (which imports sqlite3 at module level) so that the no-DB-driver
+# guarantee above holds at runtime, not just in source text. The regex below is
+# identical to the one hc_db.is_valid_identifier enforces.
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _load_identifier_validator():
-    """Load ``is_valid_identifier`` from hc_db without importing it into globals.
+def is_valid_identifier(name: str) -> bool:
+    """Return True if ``name`` is a safe, unquoted SQL identifier.
 
-    Returns the function object. Falls back to a local, regex-identical
-    implementation if hc_db cannot be loaded (e.g. file moved). The regex is
-    the same strict ``^[A-Za-z_][A-Za-z0-9_]*$`` rule hc_db enforces.
+    Matches ``^[A-Za-z_][A-Za-z0-9_]*$`` — the same strict rule
+    ``hc_db.is_valid_identifier`` enforces.
+
+    Args:
+        name: The candidate identifier.
+
+    Returns:
+        True if ``name`` is a non-empty str matching the identifier regex.
     """
-    try:
-        spec = importlib.util.spec_from_file_location("_hc_db_for_provision", _HC_DB_PATH)
-        if spec is None or spec.loader is None:
-            raise ImportError("could not build spec for hc_db")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module.is_valid_identifier
-    except Exception:
-        import re
-
-        _fallback_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-        def _fallback(name: str) -> bool:
-            return bool(_fallback_re.match(name))
-
-        return _fallback
-
-
-is_valid_identifier = _load_identifier_validator()
+    return isinstance(name, str) and bool(_IDENT_RE.match(name))
 
 
 def _require_identifier(name: str, kind: str) -> str:

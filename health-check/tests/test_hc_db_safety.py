@@ -1,8 +1,18 @@
 # tests/test_hc_db_safety.py
 import json, sqlite3, subprocess, sys, os
+import importlib.util
 import pytest
 
 HC = os.path.join(os.path.dirname(__file__), "..", "hc_db.py")
+
+# Import is_safe_sql directly from the module (no DB, pure guard checks).
+_HC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _HC_DIR not in sys.path:
+    sys.path.insert(0, _HC_DIR)
+_spec = importlib.util.spec_from_file_location("hc_db", os.path.join(_HC_DIR, "hc_db.py"))
+_hc_db = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_hc_db)
+is_safe_sql = _hc_db.is_safe_sql
 
 
 def _run(args, **kw):
@@ -87,9 +97,23 @@ def test_sqlite_rowcount_rejects_bad_identifier(tmp_path):
     assert "identifier" in combined or "invalid" in combined
 
 
-def test_postgres_not_implemented(tmp_path):
-    r = _run(["--engine", "postgres", "--db", "postgresql://x", "--op", "rowcount",
-              "--table", "a"])
-    assert r.returncode != 0
-    out = json.loads(r.stdout)
-    assert "error" in out
+# --- guard-hardening unit tests (no DB; pure is_safe_sql) ---
+
+@pytest.mark.parametrize("sql", [
+    "WITH t AS (DELETE FROM x RETURNING *) SELECT * FROM t",
+    "WITH t AS (SELECT 1) DELETE FROM x",
+    "EXPLAIN ANALYZE DELETE FROM x",
+    "EXPLAIN ANALYZE SELECT 1",
+])
+def test_is_safe_sql_rejects_pg_unsafe(sql):
+    assert is_safe_sql(sql) is False, f"should reject: {sql}"
+
+
+@pytest.mark.parametrize("sql", [
+    "WITH t AS (SELECT 1) SELECT * FROM t",
+    "SELECT 1",
+    "EXPLAIN SELECT 1",
+    "select count(*) from a",
+])
+def test_is_safe_sql_allows_reads(sql):
+    assert is_safe_sql(sql) is True, f"should allow: {sql}"

@@ -39,6 +39,8 @@
 !handoffs/**
 !hooks/
 !hooks/**
+!health-check/
+!health-check/**
 
 # Exclude generated/runtime files within tracked dirs
 council-automation/__pycache__/
@@ -54,6 +56,13 @@ automated-loop/.workflow/*.log
 automated-loop/.workflow/research_result*.md
 automated-loop/.workflow/metrics_summary*.json
 automated-loop/.workflow/trace*.jsonl
+
+# health-check runtime/generated files (no secrets in tracked scripts)
+health-check/__pycache__/
+health-check/.pytest_cache/
+health-check/tests/__pycache__/
+health-check/row-counts.json
+health-check/out/
 
 # Personal config files (use .example templates for public repo)
 CLAUDE.md

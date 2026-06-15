@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""hc_provision.py — provision-SQL *generator* for the /health-check tool.
+
+This module supports the command's opt-in ``--provision`` mode. When a
+health-check discovers missing infrastructure (no least-privilege read-only
+role, no ``audit_log`` table), this module GENERATES a reviewable ``.sql``
+script that the user applies manually.
+
+HARD GUARANTEE — this module NEVER connects to a database and NEVER executes
+SQL. It contains only pure string generators plus a file writer. No DB driver
+(psycopg / sqlite3 / asyncpg / ...) is imported anywhere, by design: there is
+no code path here that could touch a live database.
+
+Identifiers (role / schema / table names) are validated against the same strict
+regex used by ``hc_db.is_valid_identifier`` and quoted in the emitted SQL.
+Even though the output is written to a file rather than executed, identifier
+injection-safety still matters: the file is meant to be run verbatim by a
+privileged role, so an unvalidated name could smuggle arbitrary SQL into the
+script a reviewer trusts.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import tempfile
+from pathlib import Path
+
+# Reuse hc_db.is_valid_identifier as the single source of truth for identifier
+# validation. hc_db imports sqlite3 at module level; to keep the promise that
+# *this* module never imports a DB driver into its own namespace, we load only
+# the validator function by file location and bind it locally. If that import
+# fails for any reason, fall back to an identical local regex (documented below)
+# so the safety check is never silently skipped.
+_HC_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hc_db.py")
+
+
+def _load_identifier_validator():
+    """Load ``is_valid_identifier`` from hc_db without importing it into globals.
+
+    Returns the function object. Falls back to a local, regex-identical
+    implementation if hc_db cannot be loaded (e.g. file moved). The regex is
+    the same strict ``^[A-Za-z_][A-Za-z0-9_]*$`` rule hc_db enforces.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location("_hc_db_for_provision", _HC_DB_PATH)
+        if spec is None or spec.loader is None:
+            raise ImportError("could not build spec for hc_db")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.is_valid_identifier
+    except Exception:
+        import re
+
+        _fallback_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+        def _fallback(name: str) -> bool:
+            return bool(_fallback_re.match(name))
+
+        return _fallback
+
+
+is_valid_identifier = _load_identifier_validator()
+
+
+def _require_identifier(name: str, kind: str) -> str:
+    """Validate ``name`` as a SQL identifier or raise ``ValueError``.
+
+    Args:
+        name: The candidate identifier (role / schema / table name).
+        kind: Human-readable role of the identifier, used in the error message.
+
+    Returns:
+        The validated ``name`` unchanged.
+
+    Raises:
+        ValueError: If ``name`` is not a safe, unquoted SQL identifier.
+    """
+    if not isinstance(name, str) or not is_valid_identifier(name):
+        raise ValueError(
+            f"invalid {kind} identifier {name!r}: must match "
+            r"^[A-Za-z_][A-Za-z0-9_]*$ (injection-safe identifier)"
+        )
+    return name
+
+
+def gen_readonly_role(role: str = "healthcheck_ro", schema: str = "public") -> str:
+    """Generate Postgres SQL creating a least-privilege read-only role.
+
+    The emitted script:
+      * creates ``role`` idempotently via a ``DO $$ ... $$`` block that checks
+        ``pg_roles`` first (Postgres has no ``CREATE ROLE IF NOT EXISTS``);
+      * grants ``USAGE`` on ``schema`` and ``SELECT`` on all existing tables;
+      * sets ``ALTER DEFAULT PRIVILEGES`` so future tables also grant SELECT.
+
+    It contains NO write grants (no INSERT/UPDATE/DELETE/ALL PRIVILEGES).
+
+    Args:
+        role: Name of the read-only role to create. Validated + quoted.
+        schema: Schema to grant read access on. Validated + quoted.
+
+    Returns:
+        A Postgres SQL string (safe to write to a file for manual review).
+
+    Raises:
+        ValueError: If ``role`` or ``schema`` is not a valid SQL identifier.
+    """
+    _require_identifier(role, "role")
+    _require_identifier(schema, "schema")
+
+    return f"""-- Least-privilege read-only role for /health-check.
+-- Creates "{role}" (idempotent) and grants SELECT-only on schema "{schema}".
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+        CREATE ROLE "{role}" LOGIN;
+    END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA "{schema}" TO "{role}";
+GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}";
+
+-- Cover tables created in the future, too.
+ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT ON TABLES TO "{role}";"""
+
+
+def gen_audit_log_table(table: str = "audit_log") -> str:
+    """Generate Postgres SQL creating an audit-log table (idempotent).
+
+    The table has the columns the health-check audit ops expect:
+      * ``id``        — bigserial primary key
+      * ``user_id``   — text
+      * ``action``    — text NOT NULL
+      * ``ts``        — timestamptz NOT NULL DEFAULT now()
+      * ``metadata``  — jsonb
+
+    Two supporting indexes (``IF NOT EXISTS``) on ``(ts)`` and ``(user_id)``
+    back the queries the audit ops run.
+
+    Args:
+        table: Name of the audit-log table. Validated + quoted.
+
+    Returns:
+        A Postgres SQL string (safe to write to a file for manual review).
+
+    Raises:
+        ValueError: If ``table`` is not a valid SQL identifier.
+    """
+    _require_identifier(table, "table")
+
+    return f"""-- Audit-log table for /health-check audit ops.
+CREATE TABLE IF NOT EXISTS "{table}" (
+    id        bigserial PRIMARY KEY,
+    user_id   text,
+    action    text NOT NULL,
+    ts        timestamptz NOT NULL DEFAULT now(),
+    metadata  jsonb
+);
+
+CREATE INDEX IF NOT EXISTS "{table}_ts_idx" ON "{table}" (ts);
+CREATE INDEX IF NOT EXISTS "{table}_user_id_idx" ON "{table}" (user_id);"""
+
+
+def _header(app: str | None) -> str:
+    """Build the prepended header comment block for a provision script."""
+    suffix = f" for {app}" if app else ""
+    return (
+        f"-- /health-check generated provisions{suffix}\n"
+        "-- REVIEW BEFORE RUNNING — never auto-applied.\n"
+        "-- Apply manually against the DIRECT (non-pooler) connection with a "
+        "superuser/owner role.\n"
+        "-- Generated read-only; this script makes the MINIMUM changes for "
+        "future health-checks."
+    )
+
+
+def write_provision_sql(
+    parts: list[str], out_path: str | Path, app: str | None = None
+) -> Path:
+    """Write a reviewable provision script to disk (atomically).
+
+    Concatenates ``parts`` (blank line between each), prepended with a header
+    comment block warning the reader to review before running. Creates the
+    parent directory if missing and writes atomically (temp file in the same
+    directory + ``os.replace``) so a partial file is never left behind.
+
+    This function NEVER executes anything — it only writes text.
+
+    Args:
+        parts: SQL fragments to include, in order (e.g. role + audit table).
+        out_path: Destination path for the ``.sql`` file.
+        app: Optional app name, mentioned in the header for traceability.
+
+    Returns:
+        The ``Path`` to the written file.
+    """
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    body = "\n\n".join(parts)
+    content = _header(app) + "\n\n" + body + "\n"
+
+    # Atomic write: temp file in the same directory, then os.replace.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(out.parent), prefix=".hc_provision_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        os.replace(tmp_name, out)
+    except Exception:
+        # Clean up the temp file on any failure so no leftover remains.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    return out

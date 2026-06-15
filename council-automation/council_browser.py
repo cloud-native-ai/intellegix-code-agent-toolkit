@@ -309,6 +309,17 @@ def _load_selectors() -> dict:
 _QUERY_INST_LOG = Path.home() / ".claude" / "council-cache" / "instrumentation-query.jsonl"
 _QUERY_INST_CAP_BYTES = 10 * 1024 * 1024
 
+# 2026-06-15 session-freshness guard. A controlled A/B smoke proved both the
+# empty-synthesis (~7%) and the mid-run 360s-timeout-abort failures correlate
+# with a degraded Perplexity session: the identical query returned empty on a
+# 2.6-min-TTL session and correct synthesis on a 9.8-min one. Perplexity issues
+# pplx.session-id TTLs of 3-10 min; the keeper only refreshes every ~20 min, so
+# queries land on a dying session mid-cycle. Refresh proactively when a critical
+# cookie's remaining TTL drops below the floor. Floor = 360s worst-case query +
+# ~90s keeper/reload buffer; revisit if Perplexity shortens TTLs further.
+SESSION_FRESHNESS_THRESHOLD_S = 480
+SESSION_KEEPER_WAIT_S = 120  # max wait for the keeper to bump the cookies-file mtime
+
 
 def _emit_query_instrumentation(record: dict) -> None:
     """Append one per-query JSONL record with 10 MB tail-truncate at write time."""
@@ -325,6 +336,23 @@ def _emit_query_instrumentation(record: dict) -> None:
             f.write(json.dumps(record, default=str) + "\n")
     except Exception:
         pass
+
+
+def _cf_hostname_match(frame_url: str) -> bool:
+    """Return True if a frame URL's host is the Cloudflare challenge host.
+
+    Matches ``challenges.cloudflare.com`` or any ``*.cloudflare.com`` subdomain
+    via a structured hostname check (``urlparse().hostname``) rather than
+    substring-matching the domain inside raw HTML. The substring form is both
+    unreliable (an arbitrary page can embed the literal string) and flagged by
+    CodeQL ``py/incomplete-url-substring-sanitization``.
+    """
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(frame_url or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "challenges.cloudflare.com" or host.endswith(".cloudflare.com")
 
 
 def _is_reasoning_trail_only(text: str) -> bool:
@@ -362,6 +390,45 @@ def _is_reasoning_trail_only(text: str) -> bool:
         and reasoning_count / max(len(lines), 1) > 0.5
         and len(text) < 2500
     )
+
+
+def _validate_result(text: str, peak_len: int | None = None) -> str:
+    """Post-extraction semantic-completeness check (Perplexity #4, 2026-06-15).
+
+    NON-BLOCKING diagnostic — returns "ok" | "empty" | "suspect_truncated"; the
+    caller instruments + alerts but still returns the synthesis. High-precision by
+    design: a false "suspect" on a valid answer is worse than missing a rare
+    truncation, so we only fire on signals that virtually never end a complete
+    answer.
+
+    Signals (verified via Perplexity review):
+      (d) LENGTH REGRESSION — strongest, causal: final extraction is >15% shorter
+          than the peak .prose length seen while streaming (content that existed is
+          now gone = truncation). Independent of length, catches the cases the
+          shape rules miss (e.g. a cut mid-sentence on a proper noun).
+      (a) unclosed code fence (odd ``` count).
+      (b) substantial text (>200 chars) ending on a dangling token (— – : , ;).
+    Rule (c) from the review (dangling function-word after citation-strip) was
+    DROPPED in implementation: the only viable citation-strip regex is greedy and
+    eats real prose words, which would make (c) MISS the truncations it targets —
+    net negative for a precision-first flag. (d) covers that gap causally.
+    """
+    s = (text or "").strip()
+    if not s:
+        return "empty"
+    # (d) length regression vs streaming peak.
+    if isinstance(peak_len, (int, float)) and peak_len >= 100:
+        if (peak_len - len(s)) / peak_len > 0.15:
+            return "suspect_truncated"
+    # (a) unclosed code fence.
+    if s.count("```") % 2 == 1:
+        return "suspect_truncated"
+    # (b) dangling terminal token on substantial text.
+    if len(s) > 200:
+        tail = s.rstrip().rstrip('"”’\'')
+        if tail and tail[-1] in ("—", "–", ":", ",", ";"):
+            return "suspect_truncated"
+    return "ok"
 
 
 class PerplexityCouncil:
@@ -650,7 +717,11 @@ class PerplexityCouncil:
                 "Verify you are human" in content,
                 "Checking your browser" in content,
                 "cf-challenge" in (await page.content())[:2000],
-                "challenges.cloudflare.com" in (await page.content())[:2000],
+                # Cloudflare managed-challenge / Turnstile loads an iframe from
+                # challenges.cloudflare.com — detect it by structured frame host
+                # (the JS-challenge path with no iframe is still caught by the
+                # text indicators above, e.g. "cf-challenge").
+                any(_cf_hostname_match(f.url) for f in page.frames),
             ]
             return any(indicators)
         except Exception:
@@ -681,6 +752,10 @@ class PerplexityCouncil:
             if hasattr(self, "_query_inst"):
                 self._query_inst["chrome_path_used"] = "cdp_attached"
                 self._query_inst["cdp_keeper_alive_at_start"] = True
+            # CDP-attach skips _load_session entirely, so this is the ONLY freshness
+            # guard for the dominant path — refresh the keeper's in-place session if
+            # a critical cookie is expiring before this query could finish.
+            await self._ensure_fresh_session("cdp-attach")
             return
 
         if self.headless_fallback and self.headless:
@@ -949,6 +1024,94 @@ class PerplexityCouncil:
 
         await self.context.add_init_script(self._stealth_scripts(fingerprint=fp))
 
+    async def _ensure_fresh_session(self, reason: str = "") -> None:
+        """Refresh the Perplexity session if a critical cookie is expired or
+        expiring within SESSION_FRESHNESS_THRESHOLD_S, BEFORE submitting a query.
+
+        Both the empty-synthesis and the mid-run 360s-timeout-abort failures were
+        proven (A/B smoke, 2026-06-15) to correlate with a degraded session. The
+        existing auto-refresh lived only in _load_session, which the CDP-attach
+        path (the dominant path — every observed failure was chrome_path_used=
+        cdp_attached) never calls. This guard runs on BOTH paths.
+
+        Fires the keeper task (idempotent — Task Scheduler refuses a 2nd instance
+        of the one-shot, so no lock is needed) and waits up to SESSION_KEEPER_WAIT_S
+        for the cookies-file mtime to bump. On timeout/failure it logs and PROCEEDS
+        with the current session — it never aborts, because an abort cascades into
+        the runner's SKIPPED-NETWORK-STREAK and a stale session still usually
+        succeeds. Because we CDP-attach to the same keeper Chrome that the keeper
+        refreshes in-place, the live attached session picks up the new cookies.
+        """
+        freshness = self._check_session_freshness(self.session_path)
+        if hasattr(self, "_query_inst"):
+            self._query_inst["cookies_stale_critical"] = freshness.get("stale_critical", [])
+        stale = freshness.get("stale_critical") or []
+        soon = freshness.get("expiring_soon") or []
+        if not stale and not soon:
+            return  # session healthy — no-op
+
+        min_ttl = freshness.get("min_critical_ttl_s")
+        detail = (", ".join(f"{n}({age}m ago)" for n, age in stale)
+                  or ", ".join(f"{n}({s}s left)" for n, s in soon))
+        _log(f"Session-freshness guard ({reason}): critical cookies low [{detail}] "
+             f"min_ttl={int(min_ttl) if isinstance(min_ttl, (int, float)) else 'expired'}s — refreshing")
+        _log(f"MONITOR-SIGNAL cookie_stale {detail}")
+
+        auto_refresh_env = os.environ.get("COUNCIL_AUTO_REFRESH", "").lower()
+        if auto_refresh_env in ("0", "false", "no", "off"):
+            _log("COUNCIL_AUTO_REFRESH=0 (opt-out) — proceeding with stale session")
+            if hasattr(self, "_query_inst"):
+                self._query_inst["auto_refresh_path"] = "no_refresh"
+            return
+
+        # Prefer refreshing THROUGH the keeper task (no popup) when its Chrome is
+        # serving CDP; else fall back to refresh_session.py (headful popup).
+        chrome_alive = False
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
+                _ = _r.read()
+            chrome_alive = True
+        except Exception:
+            chrome_alive = False
+
+        if chrome_alive:
+            _log("Keeper Chrome alive on CDP; firing PerplexitySessionKeeper to refresh in-place...")
+            if hasattr(self, "_query_inst"):
+                self._query_inst["auto_refresh_path"] = "keeper_task"
+            try:
+                import subprocess as _subprocess
+                import time as _time
+                mtime_before = self.session_path.stat().st_mtime if self.session_path.exists() else 0.0
+                _subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Start-ScheduledTask -TaskName 'PerplexitySessionKeeper'"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                deadline = _time.time() + SESSION_KEEPER_WAIT_S
+                while _time.time() < deadline:
+                    try:
+                        mtime_now = self.session_path.stat().st_mtime
+                    except OSError:
+                        mtime_now = 0.0
+                    if mtime_now > mtime_before:
+                        _log("Keeper refreshed cookies (mtime bumped); session fresh")
+                        return
+                    _time.sleep(1)
+                # Most likely the keeper's own ~20-min auto-cycle is mid-run, so
+                # Task Scheduler refused our 2nd instance and no bump occurred.
+                _log(f"WARN: keeper-timeout-stale-proceed (no mtime bump in "
+                     f"{SESSION_KEEPER_WAIT_S}s) — proceeding with current session")
+            except Exception as e:
+                _log(f"Keeper-task refresh failed: {type(e).__name__}: {e} — proceeding")
+        else:
+            _log("No keeper Chrome on CDP; auto-refresh ON — invoking refresh_session.py ...")
+            if hasattr(self, "_query_inst"):
+                self._query_inst["auto_refresh_path"] = "refresh_session_fallback"
+            refreshed = await self._auto_refresh_session()
+            _log("Auto-refresh succeeded" if refreshed
+                 else "WARNING: auto-refresh failed — proceeding with stale session")
+
     async def _load_session(self) -> None:
         """Load session from playwright-session.json + playwright-localstorage.json.
 
@@ -960,67 +1123,9 @@ class PerplexityCouncil:
           - Otherwise continue with stale cookies (caller may still succeed if
             Cloudflare is lenient now) but the WARN is the postmortem signal.
         """
-        freshness = self._check_session_freshness(self.session_path)
-        if freshness["stale_critical"]:
-            stale_names = ", ".join(f"{n}({age}m ago)" for n, age in freshness["stale_critical"])
-            _log(f"WARNING: stale critical cookies detected: {stale_names}")
-
-            # Probe CDP first — the one-shot keeper architecture means pythonw
-            # is alive only ~3s per cycle, so PID-file check (_is_session_keeper_running)
-            # almost always returns False even when the keeper-managed Chrome
-            # is healthy. If Chrome is serving CDP, prefer refreshing THROUGH
-            # the keeper task (no popup) over refresh_session.py (headful popup).
-            chrome_alive = False
-            try:
-                import urllib.request as _ur
-                with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
-                    _ = _r.read()
-                chrome_alive = True
-            except Exception:
-                chrome_alive = False
-
-            auto_refresh_env = os.environ.get("COUNCIL_AUTO_REFRESH", "").lower()
-            auto_refresh = auto_refresh_env not in ("0", "false", "no", "off")
-
-            if chrome_alive and auto_refresh:
-                # Keeper's Chrome is up — fire Start-ScheduledTask to refresh
-                # through it. Poll the cookies file's mtime for change as the
-                # readiness signal. No Chrome popup; ~3s typical.
-                _log("Keeper Chrome alive on CDP; firing PerplexitySessionKeeper task to refresh cookies in-place...")
-                try:
-                    import subprocess as _subprocess
-                    import time as _time
-                    mtime_before = self.session_path.stat().st_mtime if self.session_path.exists() else 0.0
-                    _subprocess.run(
-                        ["powershell", "-NoProfile", "-Command",
-                         "Start-ScheduledTask -TaskName 'PerplexitySessionKeeper'"],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    deadline = _time.time() + 15
-                    while _time.time() < deadline:
-                        try:
-                            mtime_now = self.session_path.stat().st_mtime
-                        except OSError:
-                            mtime_now = 0.0
-                        if mtime_now > mtime_before:
-                            _log("Keeper task refreshed cookies — reloading from disk")
-                            break
-                        _time.sleep(1)
-                    else:
-                        _log("WARNING: keeper task did not refresh cookies within 15s; proceeding")
-                except Exception as e:
-                    _log(f"Keeper-task refresh failed: {type(e).__name__}: {e}")
-            elif auto_refresh:
-                # No keeper Chrome — fall back to refresh_session.py (headful popup).
-                _log("No keeper Chrome on CDP; auto-refresh ON - invoking refresh_session.py ...")
-                refreshed = await self._auto_refresh_session()
-                if refreshed:
-                    _log("Auto-refresh succeeded; reloading cookies from disk")
-                else:
-                    _log("WARNING: auto-refresh failed; proceeding with stale cookies")
-            else:
-                _log("COUNCIL_AUTO_REFRESH=0 (opt-out) - proceeding with stale cookies")
-                _log("Hint: `python session_keeper.py` for persistent refresh OR `python refresh_session.py` for one-shot")
+        # Proactive session-freshness guard (refactored 2026-06-15 into
+        # _ensure_fresh_session, shared with the CDP-attach path in start()).
+        await self._ensure_fresh_session("local-launch")
 
         try:
             data = json.loads(self.session_path.read_text(encoding="utf-8"))
@@ -1048,7 +1153,8 @@ class PerplexityCouncil:
         produce silent 0-byte synthesis responses from Perplexity research mode.
         """
         CRITICAL = {"__cf_bm", "pplx.edge-sid", "pplx.session-id"}
-        result = {"stale_critical": [], "all_count": 0, "expired_count": 0}
+        result = {"stale_critical": [], "expiring_soon": [], "min_critical_ttl_s": None,
+                  "all_count": 0, "expired_count": 0}
         try:
             data = json.loads(session_path.read_text(encoding="utf-8"))
         except Exception:
@@ -1056,16 +1162,27 @@ class PerplexityCouncil:
         if not isinstance(data, list):
             return result
         now = time.time()
+        min_ttl = None
         for c in data:
             result["all_count"] += 1
             exp = c.get("expires", -1)
             if not isinstance(exp, (int, float)) or exp <= 0:
                 continue  # session cookie or no expiry
+            name = c.get("name", "")
+            if name not in CRITICAL:
+                continue
             if exp < now:
                 result["expired_count"] += 1
-                name = c.get("name", "")
-                if name in CRITICAL:
-                    result["stale_critical"].append((name, int((now - exp) / 60)))
+                result["stale_critical"].append((name, int((now - exp) / 60)))
+            else:
+                ttl = exp - now
+                if min_ttl is None or ttl < min_ttl:
+                    min_ttl = ttl
+                if ttl < SESSION_FRESHNESS_THRESHOLD_S:
+                    # 2026-06-15: flag expiring-soon (not just already-expired) so the
+                    # freshness guard refreshes BEFORE the session dies mid-query.
+                    result["expiring_soon"].append((name, int(ttl)))
+        result["min_critical_ttl_s"] = min_ttl
         return result
 
     @staticmethod
@@ -1617,6 +1734,24 @@ class PerplexityCouncil:
 
     # --- Smart Completion Detection methods (Phase 1-2, 5) ---
 
+    async def _stop_button_present(self, page) -> bool:
+        """True if Perplexity's generation stop/cancel button is currently in the
+        DOM (a response is still streaming). Reuses the exact selector used by
+        _wait_for_stop_button_cycle. Fail-open: returns False on probe error so a
+        transient evaluate failure can't deadlock a caller's wait loop.
+        """
+        stop_selectors = (
+            'button[aria-label*="Stop"], button[aria-label*="Cancel"], '
+            '[data-testid*="stop"], button:has(svg circle[stroke-dasharray]), '
+            'button[class*="stop"]'
+        )
+        try:
+            return bool(await page.evaluate(
+                f"() => !!document.querySelector('{stop_selectors}')"
+            ))
+        except Exception:
+            return False
+
     async def _wait_for_stop_button_cycle(self, page, timeout: int, start: float) -> bool:
         """Wait for stop button to appear then disappear (with debounce).
 
@@ -1794,6 +1929,7 @@ class PerplexityCouncil:
         last_len = 0
         last_hash = ""
         stable_since: float | None = None
+        stop_absent_since: float | None = None  # debounce clock for stop-button-gone
         deadline = start + max_s
         no_growth_deadline = start + NO_GROWTH_GRACE_S
 
@@ -1836,6 +1972,10 @@ class PerplexityCouncil:
 
             cur_len = len(text or "")
             cur_hash = _hashlib.md5((text or "").encode("utf-8", errors="replace")).hexdigest()
+            # Track the running peak .prose length for the result-validation
+            # length-regression check (truncation = final << peak).
+            if cur_len > getattr(self, "_peak_prose_chars", 0):
+                self._peak_prose_chars = cur_len
 
             # NO_GROWTH path: nothing rendered after the grace window → bail to caller.
             if cur_len == 0 and time.time() > no_growth_deadline:
@@ -1843,8 +1983,9 @@ class PerplexityCouncil:
                 return "NO_GROWTH"
 
             if cur_len != last_len or cur_hash != last_hash:
-                # Content changed — reset stability window.
+                # Content changed — stream resumed; reset BOTH windows.
                 stable_since = None
+                stop_absent_since = None
                 last_len = cur_len
                 last_hash = cur_hash
             else:
@@ -1853,8 +1994,25 @@ class PerplexityCouncil:
                     if stable_since is None:
                         stable_since = time.time()
                     elif time.time() - stable_since >= stable_s:
-                        _log(f"Smart[{label}]: stable {stable_s}s @ {cur_len} chars — complete")
-                        return "STABLE"
+                        # 2026-06-15 truncation guard: "unchanged for stable_s" can be a
+                        # mid-stream PAUSE (Perplexity /research streams in chunks with
+                        # gaps), which previously declared STABLE and extracted a
+                        # truncated ~210-char fragment. Only complete when the generation
+                        # stop button has been ABSENT for a debounce window — content
+                        # stability alone doesn't cover an inter-section flicker where the
+                        # button briefly disappears between streamed sections. (Mirrors
+                        # _wait_for_stop_button_cycle's debounce.) Ultra-short queries that
+                        # never render a stop button still complete after the debounce.
+                        if await self._stop_button_present(page):
+                            stop_absent_since = None  # still streaming — keep waiting
+                            continue
+                        if stop_absent_since is None:
+                            stop_absent_since = time.time()  # start debounce clock
+                            continue
+                        if (time.time() - stop_absent_since) >= (BROWSER_STOP_BUTTON_DEBOUNCE_MS / 1000):
+                            _log(f"Smart[{label}]: stable {stable_s}s @ {cur_len} chars, "
+                                 f"stop button absent (debounced) — complete")
+                            return "STABLE"
 
         _log(f"Smart[{label}]: max_s={max_s} reached, content still growing or below threshold ({last_len} chars) — yielding to caller")
         return "GROWING"
@@ -1893,13 +2051,29 @@ class PerplexityCouncil:
             # mounts on large-artifact queries). Wait briefly for real content
             # to appear before declaring complete.
             try:
+                # Mount-readiness gate: wait for real synthesis (>200 chars) in
+                # .prose before declaring complete. Kept at 20s — a controlled A/B
+                # smoke (2026-06-15) DISPROVED the "needs more time" hypothesis:
+                # the empty-synthesis failures correlate with SESSION DEGRADATION
+                # (short pplx.session-id TTL), not a client-side skeleton race
+                # (identical query → empty on a 2.6min-TTL session, correct on a
+                # 9.9min one). Extending the wait only added latency to legitimate
+                # short answers (<200 chars never satisfy the gate). The real B fix
+                # is session freshness (keeper / pre-query TTL guard), not time here.
                 await page.wait_for_function(
                     "() => (document.querySelector('.prose')?.innerText?.length ?? 0) > 200",
                     timeout=20000,
                 )
                 _log("Smart: synthesis content mounted (>200 chars in .prose); complete")
+                if hasattr(self, "_query_inst"):
+                    self._query_inst["synthesis_mount_wait_outcome"] = "success"
             except Exception:
-                _log("Smart: .prose stable but never exceeded 200 chars — reasoning-only response likely; proceeding to extraction anyway")
+                # NOTE: also fires for legitimate short answers (<200 chars), so
+                # "timeout" here is NOT a clean failure signal — the authoritative
+                # empty signal is extracted_synthesis_chars==0 / exit_reason==empty_synthesis.
+                _log("Smart: .prose stable but never exceeded 200 chars in 20s — short/reasoning-only/empty; proceeding to extraction")
+                if hasattr(self, "_query_inst"):
+                    self._query_inst["synthesis_mount_wait_outcome"] = "timeout"
             return True
         # else GROWING or NO_GROWTH → fall through to stop-button cycle
 
@@ -2520,6 +2694,7 @@ class PerplexityCouncil:
                 # downstream JSON parsing fails cleanly and retry-once fires.
                 if _is_reasoning_trail_only(text):
                     _log(f"WARNING: extracted text appears reasoning-trail-only ({len(text)} chars) — treating as empty for clean retry-once")
+                    _log(f"MONITOR-SIGNAL reasoning_trail {self.perplexity_mode}")
                     results["synthesis"] = ""
                     if hasattr(self, "_query_inst"):
                         self._query_inst["reasoning_trail_detection"] = "flagged_blanked"
@@ -2543,10 +2718,54 @@ class PerplexityCouncil:
                     text = await page.evaluate(
                         f'document.querySelector("{synthesis_fallback}")?.innerText || ""'
                     )
-                results["synthesis"] = text
-                _log(f"Extracted synthesis: {len(results['synthesis'])} chars")
+                # 2026-06-13: extend reasoning-trail + empty-synthesis detection to
+                # council mode (previously research/labs only) so council responses
+                # that render only the reasoning trail are blanked + flagged instead
+                # of silently parsed as content.
+                if not text:
+                    _log("WARNING: council synthesis empty")
+                    results["synthesis"] = ""  # exit_reason/marker set by post-extraction empty-check
+                elif _is_reasoning_trail_only(text):
+                    _log(f"WARNING: council synthesis appears reasoning-trail-only ({len(text)} chars) — blanking")
+                    _log("MONITOR-SIGNAL reasoning_trail council")
+                    results["synthesis"] = ""
+                    if hasattr(self, "_query_inst"):
+                        self._query_inst["reasoning_trail_detection"] = "flagged_blanked"
+                        self._query_inst["extracted_synthesis_chars"] = 0
+                else:
+                    results["synthesis"] = text
+                    _log(f"Extracted synthesis: {len(results['synthesis'])} chars")
+                    if hasattr(self, "_query_inst"):
+                        self._query_inst["extracted_synthesis_chars"] = len(text)
             except Exception as e:
                 _log(f"WARNING: Failed to extract synthesis: {e}")
+
+        # 2026-06-14 hardening: a 0-char extraction (empty synthesis, reasoning-trail
+        # blanked, or an extraction exception) must NOT be recorded as exit_reason
+        # "completed" — that masked the most common silent failure (see the 12/202
+        # empty_synthesis records). Mark it explicitly so per-query instrumentation,
+        # calibration, and research_monitor.py all see the silent-empty failure. The
+        # bottom finally only sets "completed" when exit_reason is still None.
+        if not (results.get("synthesis") or "").strip():
+            _log(f"MONITOR-SIGNAL empty_synthesis {self.perplexity_mode}")
+            if hasattr(self, "_query_inst"):
+                self._query_inst["exit_reason"] = "empty_synthesis"
+                self._query_inst["extracted_synthesis_chars"] = 0
+
+        # End-to-end result validation (#4, 2026-06-15) — non-blocking: flag
+        # truncation/parse survivors (incl. length-regression vs streaming peak) so
+        # a plausible-but-incomplete answer is never silently stored as valid. The
+        # synthesis is still returned; the signal drives observation + monitor alerts.
+        if hasattr(self, "_query_inst"):
+            peak = getattr(self, "_peak_prose_chars", 0)
+            self._query_inst["peak_prose_chars"] = peak
+            _syn = results.get("synthesis") or ""
+            if _syn.strip():
+                _verdict = _validate_result(_syn, peak)
+                self._query_inst["result_validation"] = _verdict
+                if _verdict == "suspect_truncated":
+                    _log(f"MONITOR-SIGNAL result_suspect {self.perplexity_mode} "
+                         f"chars={len(_syn)} peak={peak}")
 
         # Find model cards (council mode only — research mode has no model cards)
         cards = []
@@ -2653,10 +2872,13 @@ class PerplexityCouncil:
             "synthesis_mount_wait_outcome": "not_triggered",
             "reasoning_trail_detection": "not_flagged",
             "extracted_synthesis_chars": 0,
+            "peak_prose_chars": 0,
+            "result_validation": "ok",
             "exit_reason": None,
             "inst_emitted": False,
         }
         self._query_inst_emitted = False
+        self._peak_prose_chars = 0  # running max .prose length seen while streaming
 
         try:
             instance_id = self._semaphore.acquire(SEMAPHORE_WAIT_TIMEOUT)

@@ -135,3 +135,64 @@ def test_stale_rejects_negative_hours(tmp_path):
               "--table", "orders", "--column", "status", "--value", "processing",
               "--age-column", "updated_at", "--older-than-hours", "-5"])
     assert r.returncode != 0
+
+
+def test_stale_sqlite_t_separated_timestamp_is_known_limitation(tmp_path):
+    # FIX B (I1) — DOCUMENTING A KNOWN LIMITATION, not asserting desired behavior.
+    #
+    # SQLite stale compares age_column lexically against datetime('now', ...),
+    # which emits canonical 'YYYY-MM-DD HH:MM:SS' (a SPACE between date and time).
+    # A timestamp stored with a 'T' separator (ISO-8601, e.g. '2026-06-15T13:00:00')
+    # sorts lexically AFTER the space form when the DATE prefix is identical,
+    # because 'T' (0x54) > ' ' (0x20) at the separator position. So a T-separated
+    # row that is chronologically OLDER than the threshold but shares the SAME
+    # calendar date as `datetime('now','-1 hours')` fails the
+    # `age_column < threshold` comparison and is NOT counted as stale. This test
+    # pins that current (wrong-for-T-timestamps) behavior so the limitation is
+    # visible, not latent. NOTE: the bug only surfaces on same-date comparisons;
+    # a T-separated row on an earlier calendar date still compares correctly
+    # because the date difference dominates before the separator char is reached.
+    db = tmp_path / "tsep.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, status TEXT, "
+                "updated_at TEXT)")
+    # A timestamp a few hours in the past TODAY (same date as the threshold),
+    # stored with a 'T' separator. Chronologically older than a 1-hour threshold,
+    # but lexically NOT less-than it due to the 'T' separator.
+    con.execute(
+        "INSERT INTO orders(id, status, updated_at) VALUES "
+        "(1, 'processing', strftime('%Y-%m-%dT%H:%M:%S', datetime('now', "
+        "'-3 hours')))"
+    )
+    # Control row: same instant but canonical (space) format -> IS counted.
+    con.execute(
+        "INSERT INTO orders(id, status, updated_at) VALUES "
+        "(2, 'processing', datetime('now', '-3 hours'))"
+    )
+    con.commit()
+    con.close()
+
+    r = _run(["--engine", "sqlite", "--db", str(db), "--op", "stale",
+              "--table", "orders", "--column", "status", "--value", "processing",
+              "--age-column", "updated_at", "--older-than-hours", "1"])
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    # Only the canonical-format row (id 2) is counted; the T-separated row (id 1),
+    # despite being equally old, is silently missed by the lexical comparison.
+    assert out["stale"] == 1
+
+
+def test_stale_older_than_hours_zero_counts_all_past_rows(tmp_path):
+    # FIX C — pin the behavior of --older-than-hours 0. With H=0 the comparison
+    # is `age_column < datetime('now')` (now-0-hours == now), so EVERY matching
+    # row whose timestamp is strictly before "now" is counted as stale. In the
+    # _make_db fixture all 3 'processing' rows (ids 3,4 at -3h and id 5 at -5m)
+    # are in the past, so all 3 count. Pinned so the behavior can't silently drift.
+    db = _make_db(tmp_path)
+    r = _run(["--engine", "sqlite", "--db", str(db), "--op", "stale",
+              "--table", "orders", "--column", "status", "--value", "processing",
+              "--age-column", "updated_at", "--older-than-hours", "0"])
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["op"] == "stale"
+    assert out["stale"] == 3

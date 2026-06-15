@@ -235,10 +235,15 @@ def _sqlite_stale(con: sqlite3.Connection, table: str, column: str, value: str,
                   age_column: str, older_than_hours: int) -> dict[str, Any]:
     """Count rows matching ``column = value`` whose ``age_column`` is older than H hours.
 
-    ``age_column`` is assumed to be a timestamp/text column comparable against
-    SQLite's ``datetime('now', ...)`` (ISO-8601 / SQLite datetime format). The
-    matched value is bound as a parameter; the relative interval string is built
-    from the validated integer H (no value interpolation of untrusted data).
+    ``age_column`` is compared lexically against SQLite's ``datetime('now', ...)``
+    output. This REQUIRES timestamps stored in canonical ``YYYY-MM-DD HH:MM:SS``
+    format (as produced by SQLite's ``datetime()``). ISO-8601 with a ``T``
+    separator or a timezone offset (e.g. ``2026-06-15T09:00:00`` or
+    ``2026-06-15 09:00:00+00:00``) sorts lexically out of order versus the
+    canonical form and may yield WRONG counts. Postgres uses typed timestamp
+    comparison and has no such requirement. The matched value is bound as a
+    parameter; the relative interval string is built from the validated integer H
+    (no value interpolation of untrusted data).
     """
     table = _require_identifier(table, "--table")
     column = _require_identifier(column, "--column")
@@ -579,7 +584,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Data value to match (stale). Bound as a parameter; "
                              "NOT validated as an identifier.")
     parser.add_argument("--age-column", default=None,
-                        help="Timestamp column to age-compare (stale).")
+                        help="Timestamp column to age-compare (stale). SQLite "
+                             "stale requires timestamps stored in canonical "
+                             "'YYYY-MM-DD HH:MM:SS' format (as produced by "
+                             "SQLite's datetime()); ISO-8601 with a 'T' separator "
+                             "or timezone offset will compare lexically and may "
+                             "yield wrong counts. Postgres uses typed timestamp "
+                             "comparison.")
     parser.add_argument("--older-than-hours", type=int, default=None,
                         help="Age threshold in hours for the stale op. Must be a "
                              "non-negative integer.")

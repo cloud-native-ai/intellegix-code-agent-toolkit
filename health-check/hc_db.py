@@ -10,8 +10,11 @@ opened with OS-level read-only mode (``mode=ro``).
 Output contract: all results are JSON on stdout. Aggregate/scalar values only —
 row contents are never selected, EXCEPT via the ``--raw`` test/escape hatch,
 which returns the rows of a guarded SELECT-only query (used for diagnostics and
-tests). On refusal or error a JSON ``{"error": ...}`` object is printed to
-stdout, a short message to stderr, and the process exits non-zero.
+tests). Because ``--raw`` can return full row contents from a live database, it
+is GATED: it is refused unless the environment variable ``HC_ALLOW_RAW=1`` is
+set. The gate is enforced centrally before engine dispatch and applies to both
+SQLite and Postgres. On refusal or error a JSON ``{"error": ...}`` object is
+printed to stdout, a short message to stderr, and the process exits non-zero.
 
 The ``rowcount`` op + raw path are implemented for both SQLite and Postgres.
 Postgres additionally runs every query inside a READ ONLY transaction (the real
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -77,6 +81,14 @@ def is_safe_sql(sql: str) -> bool:
         SQLite (mode=ro) but write on Postgres.
 
     A trailing ``;`` with only whitespace after it is allowed.
+
+    NOTE — lexical guard limitation: this function does NOT parse SQL. It is a
+    purely lexical check (prefix match + whole-word keyword regex). It may
+    produce false REFUSALS when a data-modifying keyword appears inside a string
+    literal or a quoted identifier within a ``WITH`` statement (e.g.
+    ``WITH t AS (SELECT 'delete me') SELECT * FROM t``). On Postgres the
+    server-side ``READ ONLY`` transaction is the AUTHORITATIVE write-prevention
+    guarantee; ``is_safe_sql`` is defense-in-depth layered on top of it.
     """
     if sql is None:
         return False
@@ -203,6 +215,21 @@ def _pg_read_only_flag(conn: Any) -> bool:
     return bool(row and str(row[0]).lower() == "on")
 
 
+def _pg_writable_role(conn: Any) -> bool:
+    """Return True if the current role COULD write to the database/public schema.
+
+    Advisory probe only: runs as a guarded SELECT (binds nothing) and reports
+    whether the role holds CREATE on the database or the ``public`` schema. This
+    is informational — the READ ONLY transaction is the hard write-prevention
+    guarantee regardless of the role's privileges.
+    """
+    row = conn.execute(
+        "SELECT has_database_privilege(current_user, current_database(), "
+        "'CREATE') OR has_schema_privilege(current_user, 'public', 'CREATE')"
+    ).fetchone()
+    return bool(row and row[0])
+
+
 def _pg_rowcount(conn: Any, table: str, exact: bool) -> dict[str, Any]:
     """Row count for a Postgres table.
 
@@ -266,11 +293,10 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
         _fail(msg, error_obj={"error": msg})
 
     try:
-        # Resource caps applied before any READ ONLY transaction starts. With
-        # autocommit on (psycopg3 default), each statement is its own txn.
-        conn.execute("SET statement_timeout = '5s'")
-        conn.execute("SET work_mem = '4MB'")
-        # Make the session default read-only so the next transaction inherits it.
+        # Belt-and-suspenders: make the session default read-only so the next
+        # transaction inherits it. With autocommit on (psycopg3 default) this is
+        # a session-level SET. The txn-local SET TRANSACTION READ ONLY below is
+        # the load-bearing guarantee on transaction-mode poolers.
         conn.execute("SET default_transaction_read_only = on")
 
         # Run all real work inside an explicit READ ONLY transaction. Turning
@@ -280,7 +306,32 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
         conn.autocommit = False
         conn.execute("SET TRANSACTION READ ONLY")
 
+        # FIX 3 — pooler-safe resource caps applied with SET LOCAL INSIDE the
+        # open read-only transaction, so they are scoped to the txn that runs
+        # the user's query and survive transaction-mode poolers (which reset
+        # session-level SETs between checkouts).
+        conn.execute("SET LOCAL statement_timeout = '5s'")
+        conn.execute("SET LOCAL work_mem = '4MB'")
+
         read_only = _pg_read_only_flag(conn)
+
+        # FIX 1 — fail closed: ENFORCE read-only as a precondition. If the txn
+        # did not actually establish READ ONLY, abort BEFORE running the user's
+        # query rather than merely reporting it in the JSON.
+        if not read_only:
+            conn.rollback()
+            _fail(
+                "refused: could not establish READ ONLY transaction (read-only "
+                "precondition not met)",
+                error_obj={"error": "refused: could not establish read-only "
+                                    "transaction"},
+            )
+
+        # FIX 2 — write-permission probe (advisory). The READ ONLY txn remains
+        # the hard guarantee; this only surfaces whether the role COULD write,
+        # so Task 8's P0 gate can read "writable_role" by name. Do NOT refuse on
+        # a writable role — the transaction is the guarantee.
+        writable_role = _pg_writable_role(conn)
 
         if args.raw is not None:
             result = _pg_raw(conn, args.raw)
@@ -297,6 +348,7 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
         conn.rollback()
 
         result["transaction_read_only"] = read_only
+        result["writable_role"] = writable_role
         result.update(pooler_meta)
         return result
     except SystemExit:
@@ -342,6 +394,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.raw is None and args.op is None:
         _fail("nothing to do: provide --op or --raw",
               error_obj={"error": "nothing to do: provide --op or --raw"})
+
+    # FIX 4 — central gate for the --raw row-dump escape hatch. --raw can return
+    # full row contents from a live database; refuse it unless explicitly opted
+    # in via HC_ALLOW_RAW=1. Enforced once here, before engine dispatch, so it
+    # covers both SQLite and Postgres. (is_safe_sql still runs after the gate.)
+    if args.raw is not None and os.environ.get("HC_ALLOW_RAW") != "1":
+        _fail(
+            "refused: --raw is gated; set HC_ALLOW_RAW=1 to use the diagnostic "
+            "escape hatch",
+            error_obj={"error": "refused: --raw is gated; set HC_ALLOW_RAW=1 "
+                                "to use the diagnostic escape hatch"},
+        )
 
     if args.engine == "sqlite":
         result = _handle_sqlite(args)

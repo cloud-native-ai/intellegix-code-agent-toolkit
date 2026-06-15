@@ -43,7 +43,8 @@ def test_sqlite_select_only_returns_json(tmp_path):
 def test_sqlite_refuses_write_sql(tmp_path):
     db = tmp_path / "t.db"
     sqlite3.connect(db).close()
-    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", "DELETE FROM sqlite_master"])
+    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", "DELETE FROM sqlite_master"],
+             env={**os.environ, "HC_ALLOW_RAW": "1"})
     assert r.returncode != 0
     assert "read-only" in (r.stdout + r.stderr).lower()
 
@@ -52,7 +53,8 @@ def test_sqlite_refuses_write_sql(tmp_path):
 
 def test_sqlite_raw_select_with_whitespace_and_case_allowed(tmp_path):
     db = _make_db(tmp_path)
-    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", "  SeLeCt 1 "])
+    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", "  SeLeCt 1 "],
+             env={**os.environ, "HC_ALLOW_RAW": "1"})
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
     assert "rows" in out or "result" in out
@@ -61,14 +63,16 @@ def test_sqlite_raw_select_with_whitespace_and_case_allowed(tmp_path):
 def test_sqlite_raw_cte_allowed(tmp_path):
     db = _make_db(tmp_path)
     r = _run(["--engine", "sqlite", "--db", str(db), "--raw",
-              "WITH x AS (SELECT 1) SELECT * FROM x"])
+              "WITH x AS (SELECT 1) SELECT * FROM x"],
+             env={**os.environ, "HC_ALLOW_RAW": "1"})
     assert r.returncode == 0, r.stderr
     json.loads(r.stdout)
 
 
 def test_sqlite_raw_explain_allowed(tmp_path):
     db = _make_db(tmp_path)
-    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", "EXPLAIN SELECT 1"])
+    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", "EXPLAIN SELECT 1"],
+             env={**os.environ, "HC_ALLOW_RAW": "1"})
     assert r.returncode == 0, r.stderr
     json.loads(r.stdout)
 
@@ -82,9 +86,20 @@ def test_sqlite_raw_explain_allowed(tmp_path):
 ])
 def test_sqlite_raw_write_variants_refused(tmp_path, sql):
     db = _make_db(tmp_path)
-    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", sql])
+    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", sql],
+             env={**os.environ, "HC_ALLOW_RAW": "1"})
     assert r.returncode != 0, f"expected refusal for: {sql}"
     assert "read-only" in (r.stdout + r.stderr).lower()
+
+
+def test_sqlite_raw_gated_without_env_var(tmp_path):
+    # FIX 4 — --raw must be refused as gated when HC_ALLOW_RAW is not set, and
+    # the guard (is_safe_sql) is never even reached for an otherwise-valid SELECT.
+    db = _make_db(tmp_path)
+    env = {k: v for k, v in os.environ.items() if k != "HC_ALLOW_RAW"}
+    r = _run(["--engine", "sqlite", "--db", str(db), "--raw", "SELECT 1"], env=env)
+    assert r.returncode != 0
+    assert "gated" in (r.stdout + r.stderr).lower()
 
 
 def test_sqlite_rowcount_rejects_bad_identifier(tmp_path):

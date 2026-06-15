@@ -39,3 +39,4 @@ jobs:
             --cov=automated-loop \
             --cov-report=term-missing \
             --cov-fail-under=60
+          pytest health-check/tests/ -v

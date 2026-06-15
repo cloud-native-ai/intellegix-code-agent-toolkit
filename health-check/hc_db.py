@@ -424,6 +424,33 @@ def _sqlite_audit_fingerprint(con: sqlite3.Connection, table: str,
     return {"op": "audit_fingerprint", "table": table, "users": users}
 
 
+def _sqlite_value_distribution(con: sqlite3.Connection, table: str,
+                               column: str, top: int) -> dict[str, Any]:
+    """Top-N value frequencies for ``column`` (aggregate-only GROUP BY value).
+
+    Returns the ``top`` most frequent values in count-desc order, each as
+    ``{"value": v, "n": count}``. NULL is NOT filtered: a NULL group is
+    informative (it serializes as JSON ``null``) and surfaces unexpected nulls.
+
+    Intentionally FILTER-FREE: there is no WHERE clause. A filtered variant
+    (e.g. distribution restricted to a status subset) should be a SEPARATE op
+    if ever needed — not a flag bolted onto this one (YAGNI per review).
+    """
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    n = _require_positive_int(top, "--top")
+    # n is a validated positive int; bound as a parameter all the same so the
+    # SQL differs from Postgres only by the placeholder style (? vs %s).
+    sql = (
+        f'SELECT "{column}" AS v, count(*) AS n FROM "{table}" '
+        f'GROUP BY "{column}" ORDER BY n DESC LIMIT ?'
+    )
+    values = [{"value": row[0], "n": int(row[1])}
+              for row in con.execute(sql, (n,)).fetchall()]
+    return {"op": "value_distribution", "table": table, "column": column,
+            "values": values}
+
+
 def _sqlite_audit_recency(con: sqlite3.Connection, table: str,
                           ts_column: str) -> dict[str, Any]:
     """Last-write timestamp + 24h / 7d event counts.
@@ -495,6 +522,9 @@ def _handle_sqlite(args: argparse.Namespace) -> dict[str, Any]:
                                              args.action_column)
         if args.op == "audit_recency":
             return _sqlite_audit_recency(con, args.table, args.ts_column)
+        if args.op == "value_distribution":
+            return _sqlite_value_distribution(con, args.table, args.column,
+                                              args.top)
         _fail(f"unknown op: {args.op!r}",
               error_obj={"error": f"unknown op: {args.op}"})
     finally:
@@ -863,6 +893,31 @@ def _pg_audit_fingerprint(conn: Any, table: str, user_column: str,
     return {"op": "audit_fingerprint", "table": table, "users": users}
 
 
+def _pg_value_distribution(conn: Any, table: str, column: str,
+                           top: int) -> dict[str, Any]:
+    """Top-N value frequencies for ``column`` (aggregate-only GROUP BY value).
+
+    Returns the ``top`` most frequent values in count-desc order, each as
+    ``{"value": v, "n": count}``. NULL is NOT filtered: a NULL group is
+    informative (it serializes as JSON ``null``) and surfaces unexpected nulls.
+
+    Intentionally FILTER-FREE: there is no WHERE clause. A filtered variant
+    (e.g. distribution restricted to a status subset) should be a SEPARATE op
+    if ever needed — not a flag bolted onto this one (YAGNI per review).
+    """
+    table = _require_identifier(table, "--table")
+    column = _require_identifier(column, "--column")
+    n = _require_positive_int(top, "--top")
+    sql = (
+        f'SELECT "{column}" AS v, count(*) AS n FROM "{table}" '
+        f'GROUP BY "{column}" ORDER BY n DESC LIMIT %s'
+    )
+    values = [{"value": row[0], "n": int(row[1])}
+              for row in conn.execute(sql, (n,)).fetchall()]
+    return {"op": "value_distribution", "table": table, "column": column,
+            "values": values}
+
+
 def _pg_audit_recency(conn: Any, table: str, ts_column: str) -> dict[str, Any]:
     """Last-write timestamp + 24h / 7d event counts (typed timestamp compare)."""
     table = _require_identifier(table, "--table")
@@ -995,6 +1050,9 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
                                            args.action_column)
         elif args.op == "audit_recency":
             result = _pg_audit_recency(conn, args.table, args.ts_column)
+        elif args.op == "value_distribution":
+            result = _pg_value_distribution(conn, args.table, args.column,
+                                            args.top)
         else:
             _fail(f"unknown op: {args.op!r}",
                   error_obj={"error": f"unknown op: {args.op}"})
@@ -1033,7 +1091,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--op", default=None,
                         help="Operation to run (e.g. schema, rowcount, "
                              "connections, fk_orphans, duplicates, null_drift, "
-                             "stale, audit_*). 'connections' reports current/max/"
+                             "stale, value_distribution, audit_*). "
+                             "'value_distribution' reports the top-N most "
+                             "frequent values of a column (count-desc; NULL "
+                             "group included). 'connections' reports current/max/"
                              "available backends for a pool-saturation preflight "
                              "(postgres; n/a for sqlite). 'schema' lists "
                              "tables/columns/FKs "
@@ -1085,6 +1146,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold", type=int, default=None,
                         help="Burst threshold for audit_velocity: report buckets "
                              "with event count >= this. Must be >= 1.")
+    parser.add_argument("--top", type=int, default=20,
+                        help="Max number of value-groups returned by "
+                             "value_distribution (count-desc). Must be a "
+                             "positive integer >= 1. Default 20.")
     parser.add_argument("--raw", default=None,
                         help="Raw SQL escape hatch. Still SELECT-only guarded.")
     parser.add_argument("--exact", action="store_true",

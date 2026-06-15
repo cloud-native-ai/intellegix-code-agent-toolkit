@@ -78,6 +78,8 @@ def _base_args(**overrides) -> argparse.Namespace:
         engine="postgres", db="postgresql://u@localhost/db",
         op=None, table=None, child=None, column=None, parent=None,
         parent_column=None, value=None, age_column=None, older_than_hours=None,
+        user_column=None, action_column=None, ts_column=None,
+        window_seconds=None, threshold=None, top=20,
         raw=None, exact=False,
     )
     defaults.update(overrides)
@@ -355,6 +357,42 @@ def test_pg_audit_recency_sql_shape_and_quoting(monkeypatch):
     assert _read_only_setup_ran_before(fake_conn, interval_sql)
     assert result["op"] == "audit_recency"
     assert result["table"] == "audit_log"
+
+
+def test_pg_value_distribution_sql_shape_and_quoting(monkeypatch):
+    args = _base_args(op="value_distribution", table="audit_events",
+                      column="event_type", top=20)
+    fake_conn, result = _run_op(monkeypatch, args)
+    # The op's distribution query is the one with GROUP BY + LIMIT.
+    dist_sql = _first_sql_containing(fake_conn, "group by")
+    low = dist_sql.lower()
+    # Quoted identifiers, no value interpolation.
+    assert '"audit_events"' in dist_sql
+    assert '"event_type"' in dist_sql
+    assert "group by" in low
+    assert "order by" in low
+    assert "limit %s" in low
+    # Aggregate-only: count(*), no row-content selection.
+    assert "count(" in low
+    # No WHERE clause — value_distribution is intentionally filter-free.
+    assert "where" not in low
+    # The LIMIT is bound as a param (not dangerous interpolation).
+    dist_params = next(params for sql, params in fake_conn.executed
+                       if sql == dist_sql)
+    assert dist_params == (20,)
+    # Read-only setup ran before the op.
+    assert _read_only_setup_ran_before(fake_conn, dist_sql)
+    assert result["op"] == "value_distribution"
+    assert result["table"] == "audit_events"
+    assert result["column"] == "event_type"
+    assert result["values"] == []  # empty recording result -> no values
+
+
+def test_pg_value_distribution_rejects_zero_top(monkeypatch):
+    args = _base_args(op="value_distribution", table="audit_events",
+                      column="event_type", top=0)
+    with pytest.raises(SystemExit):
+        _run_op(monkeypatch, args)
 
 
 def test_pg_audit_velocity_rejects_zero_window(monkeypatch):

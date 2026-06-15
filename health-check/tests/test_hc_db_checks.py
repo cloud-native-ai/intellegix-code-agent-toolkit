@@ -67,6 +67,78 @@ def _make_db(tmp_path):
     return db
 
 
+def _make_schema_db(tmp_path):
+    """Build a DB whose schema exercises pk / notnull / FK introspection."""
+    db = tmp_path / "schema.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE customers(id INTEGER PRIMARY KEY)")
+    con.execute(
+        "CREATE TABLE orders("
+        "id INTEGER PRIMARY KEY, "
+        "customer_id INTEGER REFERENCES customers(id), "
+        "status TEXT NOT NULL)"
+    )
+    con.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")
+    con.commit()
+    con.close()
+    return db
+
+
+def _assert_no_raw_gate(env):
+    """Fail the test if HC_ALLOW_RAW leaked into the call environment."""
+    assert env.get("HC_ALLOW_RAW") in (None, ""), (
+        "schema must not require HC_ALLOW_RAW")
+
+
+def test_schema_lists_all_tables_with_columns_and_fks(tmp_path):
+    db = _make_schema_db(tmp_path)
+    # Build an env that explicitly has NO HC_ALLOW_RAW set.
+    env = {k: v for k, v in os.environ.items() if k != "HC_ALLOW_RAW"}
+    _assert_no_raw_gate(env)
+    r = _run(["--engine", "sqlite", "--db", str(db), "--op", "schema"], env=env)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["op"] == "schema"
+    by_name = {t["table"]: t for t in out["tables"]}
+    # All three tables discovered.
+    assert set(by_name) == {"customers", "orders", "users"}
+
+    orders = by_name["orders"]
+    cols = {c["name"]: c for c in orders["columns"]}
+    assert "customer_id" in cols
+    # id columns show pk:true.
+    assert cols["id"]["pk"] is True
+    assert by_name["customers"]["columns"][0]["name"] == "id"
+    assert {c["name"]: c for c in by_name["customers"]["columns"]}["id"]["pk"] \
+        is True
+    # NOT NULL column shows notnull:true.
+    assert cols["status"]["notnull"] is True
+    # FK relationship surfaced.
+    assert {"column": "customer_id", "ref_table": "customers",
+            "ref_column": "id"} in orders["foreign_keys"]
+
+
+def test_schema_scoped_to_one_table(tmp_path):
+    db = _make_schema_db(tmp_path)
+    env = {k: v for k, v in os.environ.items() if k != "HC_ALLOW_RAW"}
+    _assert_no_raw_gate(env)
+    r = _run(["--engine", "sqlite", "--db", str(db), "--op", "schema",
+              "--table", "orders"], env=env)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert [t["table"] for t in out["tables"]] == ["orders"]
+
+
+def test_schema_rejects_bad_table_identifier(tmp_path):
+    db = _make_schema_db(tmp_path)
+    env = {k: v for k, v in os.environ.items() if k != "HC_ALLOW_RAW"}
+    r = _run(["--engine", "sqlite", "--db", str(db), "--op", "schema",
+              "--table", "x; DROP TABLE y"], env=env)
+    assert r.returncode != 0
+    combined = (r.stdout + r.stderr).lower()
+    assert "identifier" in combined or "invalid" in combined
+
+
 def test_fk_orphans_counts_unmatched_children(tmp_path):
     db = _make_db(tmp_path)
     r = _run(["--engine", "sqlite", "--db", str(db), "--op", "fk_orphans",

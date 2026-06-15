@@ -200,6 +200,62 @@ def _sqlite_raw(con: sqlite3.Connection, sql: str) -> dict[str, Any]:
     return {"rows": [list(row) for row in rows]}
 
 
+def _sqlite_schema(con: sqlite3.Connection,
+                   table: str | None) -> dict[str, Any]:
+    """Introspect tables/columns/foreign-keys via read-only PRAGMA functions.
+
+    Dedicated code path that does NOT route through ``is_safe_sql`` or the
+    ``--raw`` gate: it issues only fixed introspection statements. Table names
+    come from ``sqlite_master`` (or the validated ``--table`` arg); every name
+    interpolated into a PRAGMA is re-validated with ``is_valid_identifier`` and
+    double-quoted. Metadata only — no row contents are read. PRAGMA on a
+    ``mode=ro`` connection cannot write.
+    """
+    if table is not None:
+        # Already validated by _require_identifier at the call site, but the
+        # name is interpolated into PRAGMA text below, so re-assert here.
+        table = _require_identifier(table, "--table")
+        names = [table]
+    else:
+        rows = con.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name"
+        ).fetchall()
+        names = [r[0] for r in rows]
+
+    tables: list[dict[str, Any]] = []
+    for name in names:
+        # Defense-in-depth: every name interpolated into a PRAGMA is validated
+        # and quoted, even those sourced from sqlite_master.
+        if not is_valid_identifier(name):
+            _fail(f"invalid identifier: {name!r}",
+                  error_obj={"error": f"invalid identifier: {name}"})
+        columns: list[dict[str, Any]] = []
+        for row in con.execute(f'PRAGMA table_info("{name}")').fetchall():
+            # PRAGMA table_info columns: (cid, name, type, notnull, dflt, pk)
+            columns.append({
+                "name": row[1],
+                "type": row[2],
+                "notnull": bool(row[3]),
+                "pk": bool(row[5]),
+            })
+        foreign_keys: list[dict[str, Any]] = []
+        for row in con.execute(
+                f'PRAGMA foreign_key_list("{name}")').fetchall():
+            # PRAGMA foreign_key_list columns:
+            # (id, seq, table, from, to, on_update, on_delete, match)
+            foreign_keys.append({
+                "column": row[3],
+                "ref_table": row[2],
+                "ref_column": row[4],
+            })
+        tables.append({"table": name, "columns": columns,
+                       "foreign_keys": foreign_keys})
+
+    return {"op": "schema", "tables": tables}
+
+
 def _sqlite_fk_orphans(con: sqlite3.Connection, child: str, column: str,
                        parent: str, parent_column: str) -> dict[str, Any]:
     """Count child rows whose ``column`` is set but has no matching parent row.
@@ -401,6 +457,10 @@ def _handle_sqlite(args: argparse.Namespace) -> dict[str, Any]:
     try:
         if args.raw is not None:
             return _sqlite_raw(con, args.raw)
+        if args.op == "schema":
+            table = (_require_identifier(args.table, "--table")
+                     if args.table else None)
+            return _sqlite_schema(con, table)
         if args.op == "rowcount":
             if not args.table:
                 _fail("--table is required for --op rowcount",
@@ -532,6 +592,100 @@ def _pg_raw(conn: Any, sql: str) -> dict[str, Any]:
     cur = conn.execute(sql)
     rows = cur.fetchall() if cur.description is not None else []
     return {"rows": [list(row) for row in rows]}
+
+
+def _pg_schema(conn: Any, table: str | None) -> dict[str, Any]:
+    """Introspect tables/columns/PKs/FKs via information_schema (plain SELECTs).
+
+    These are ordinary read-only SELECTs against ``information_schema`` so they
+    run on the normal pg query path inside the open READ ONLY transaction set up
+    by ``_handle_postgres``. Schema/table FILTERS are values in information_schema
+    (not identifiers), so they are bound as PARAMETERS. Metadata only — no row
+    contents. Requires NO ``HC_ALLOW_RAW``.
+    """
+    if table is not None:
+        table = _require_identifier(table, "--table")
+
+    # 1) Tables in user schemas (optionally scoped to one table by name).
+    tbl_sql = (
+        "SELECT table_schema, table_name FROM information_schema.tables "
+        "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+        "AND table_type = 'BASE TABLE'"
+    )
+    tbl_params: list[Any] = []
+    if table is not None:
+        tbl_sql += " AND table_name = %s"
+        tbl_params.append(table)
+    tbl_sql += " ORDER BY table_schema, table_name"
+    table_rows = conn.execute(tbl_sql, tuple(tbl_params)).fetchall()
+
+    # 2) Columns (name, type, nullability) for the in-scope tables.
+    col_sql = (
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable "
+        "FROM information_schema.columns "
+        "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')"
+    )
+    col_params: list[Any] = []
+    if table is not None:
+        col_sql += " AND table_name = %s"
+        col_params.append(table)
+    col_sql += " ORDER BY table_schema, table_name, ordinal_position"
+    col_rows = conn.execute(col_sql, tuple(col_params)).fetchall()
+
+    # 3) PRIMARY KEY columns, joined through table_constraints.
+    pk_sql = (
+        "SELECT tc.table_schema, tc.table_name, kcu.column_name "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "ON tc.constraint_name = kcu.constraint_name "
+        "AND tc.table_schema = kcu.table_schema "
+        "WHERE tc.constraint_type = 'PRIMARY KEY' "
+        "AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')"
+    )
+    pk_params: list[Any] = []
+    if table is not None:
+        pk_sql += " AND tc.table_name = %s"
+        pk_params.append(table)
+    pk_rows = conn.execute(pk_sql, tuple(pk_params)).fetchall()
+
+    # 4) FOREIGN KEY column -> referenced table.column.
+    fk_sql = (
+        "SELECT tc.table_schema, tc.table_name, kcu.column_name, "
+        "ccu.table_name AS ref_table, ccu.column_name AS ref_column "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "ON tc.constraint_name = kcu.constraint_name "
+        "AND tc.table_schema = kcu.table_schema "
+        "JOIN information_schema.constraint_column_usage ccu "
+        "ON tc.constraint_name = ccu.constraint_name "
+        "AND tc.table_schema = ccu.table_schema "
+        "WHERE tc.constraint_type = 'FOREIGN KEY' "
+        "AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')"
+    )
+    fk_params: list[Any] = []
+    if table is not None:
+        fk_sql += " AND tc.table_name = %s"
+        fk_params.append(table)
+    fk_rows = conn.execute(fk_sql, tuple(fk_params)).fetchall()
+
+    # Fold into the {table, columns[], foreign_keys[]} output shape.
+    pk_set = {(r[0], r[1], r[2]) for r in pk_rows}
+    tables: list[dict[str, Any]] = []
+    for tschema, tname in table_rows:
+        columns = [
+            {"name": c[2], "type": c[3],
+             "notnull": str(c[4]).upper() == "NO",
+             "pk": (c[0], c[1], c[2]) in pk_set}
+            for c in col_rows if c[0] == tschema and c[1] == tname
+        ]
+        foreign_keys = [
+            {"column": f[2], "ref_table": f[3], "ref_column": f[4]}
+            for f in fk_rows if f[0] == tschema and f[1] == tname
+        ]
+        tables.append({"table": tname, "columns": columns,
+                       "foreign_keys": foreign_keys})
+
+    return {"op": "schema", "tables": tables}
 
 
 def _pg_fk_orphans(conn: Any, child: str, column: str, parent: str,
@@ -747,6 +901,10 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
 
         if args.raw is not None:
             result = _pg_raw(conn, args.raw)
+        elif args.op == "schema":
+            table = (_require_identifier(args.table, "--table")
+                     if args.table else None)
+            result = _pg_schema(conn, table)
         elif args.op == "rowcount":
             if not args.table:
                 _fail("--table is required for --op rowcount",
@@ -813,8 +971,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", required=True,
                         help="Connection string / path (CLI-only; never hardcoded).")
     parser.add_argument("--op", default=None,
-                        help="Operation to run (e.g. rowcount). Future: "
-                             "fk_orphans, duplicates, audit_*.")
+                        help="Operation to run (e.g. schema, rowcount, "
+                             "fk_orphans, duplicates, null_drift, stale, "
+                             "audit_*). 'schema' lists tables/columns/FKs "
+                             "(read-only introspection; no HC_ALLOW_RAW "
+                             "needed); optional --table scopes to one table.")
     parser.add_argument("--table", default=None,
                         help="Table identifier for table-scoped ops.")
     parser.add_argument("--child", default=None,

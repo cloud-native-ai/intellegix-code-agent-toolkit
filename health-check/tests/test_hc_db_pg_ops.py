@@ -138,6 +138,40 @@ def _op_count_stmt(fake_conn: _RecordingConn) -> tuple[str, object]:
     raise AssertionError(f"no COUNT statement found in {fake_conn.executed!r}")
 
 
+# --- schema (Task: read-only introspection, no --raw gate) --------------------
+
+def test_pg_schema_queries_information_schema_after_ro_setup(monkeypatch):
+    args = _base_args(op="schema")
+    fake_conn, result = _run_op(monkeypatch, args)
+    sqls = _executed_sql(fake_conn)
+    info_sqls = [s for s in sqls if "information_schema" in s.lower()]
+    # Tables/columns/PK/FK introspection all hit information_schema.
+    assert info_sqls, f"no information_schema query in {sqls!r}"
+    assert any("information_schema.tables" in s.lower() for s in info_sqls)
+    assert any("information_schema.columns" in s.lower() for s in info_sqls)
+    assert any("foreign key" in s.lower() for s in info_sqls)
+    # Read-only txn setup ran before the first information_schema query.
+    assert _read_only_setup_ran_before(fake_conn, info_sqls[0])
+    # No --table filter -> no param binding on the table query.
+    tbl_stmt = next((sql, params) for sql, params in fake_conn.executed
+                    if "information_schema.tables" in sql.lower())
+    assert tbl_stmt[1] in (None, (), [])
+    assert result["op"] == "schema"
+    assert result["tables"] == []  # empty recording result folds to no tables
+
+
+def test_pg_schema_binds_table_filter_as_param(monkeypatch):
+    args = _base_args(op="schema", table="orders")
+    fake_conn, result = _run_op(monkeypatch, args)
+    # The table filter is a VALUE in information_schema -> bound as a param,
+    # never interpolated as an identifier.
+    tbl_stmt = next((sql, params) for sql, params in fake_conn.executed
+                    if "information_schema.tables" in sql.lower())
+    assert "table_name = %s" in tbl_stmt[0].lower()
+    assert tbl_stmt[1] == ("orders",)
+    assert result["op"] == "schema"
+
+
 # --- fk_orphans ---------------------------------------------------------------
 
 def test_pg_fk_orphans_sql_shape_and_quoting(monkeypatch):

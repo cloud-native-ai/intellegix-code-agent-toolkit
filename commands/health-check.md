@@ -212,17 +212,39 @@ was resolved. Engine is `sqlite` or `postgres` per P0.
 
 ### P2.1 Schema introspection (read-only)
 
-Discover tables and FK relationships read-only:
+Discover tables, columns, and FK relationships with the dedicated `schema` op — **no
+`HC_ALLOW_RAW` needed**:
 
-- **Postgres:** query `information_schema.tables` /
-  `information_schema.table_constraints` + `key_column_usage` for FK pairs.
-- **SQLite:** query `sqlite_master` (and `PRAGMA foreign_key_list` per table).
+```
+python health-check/hc_db.py --engine <e> --db <db> --op schema
+```
 
-These are read-only `SELECT`s. **Prefer dedicated ops** for the actual checks. If you must run
-introspection SQL through `hc_db.py`, the `--raw` escape hatch is **GATED**: it is refused
-unless the environment variable `HC_ALLOW_RAW=1` is set (it can return row contents, so it is
-off by default). Set `HC_ALLOW_RAW=1` only for the introspection `SELECT`s, and never use it to
-dump table row contents.
+Add `--table <t>` to scope to a single table. Output shape (metadata only — never row
+contents):
+
+```json
+{"op":"schema","tables":[
+  {"table":"orders",
+   "columns":[{"name":"id","type":"INTEGER","notnull":true,"pk":true}, ...],
+   "foreign_keys":[{"column":"customer_id","ref_table":"customers","ref_column":"id"}, ...]}
+  , ...]}
+```
+
+Under the hood this is read-only introspection:
+
+- **Postgres:** plain `SELECT`s against `information_schema.tables` /
+  `information_schema.columns` / `information_schema.table_constraints` joined to
+  `key_column_usage` / `constraint_column_usage` (PK + FK), run inside the server-enforced
+  `READ ONLY` transaction. Schema/table filters are bound as **parameters**.
+- **SQLite:** `sqlite_master` for table names, then `PRAGMA table_info` / `PRAGMA
+  foreign_key_list` per table over the `mode=ro` connection. This is a dedicated code path
+  that does NOT go through `is_safe_sql` or the `--raw` gate; every interpolated table name
+  is identifier-validated and quoted.
+
+Use `--op schema` to drive the integrity ops below (FK pairs, unique/NOT NULL columns).
+**Do not** use the gated `--raw` hatch for introspection — `schema` covers it without
+un-gating row dumps. The `--raw` escape hatch remains **GATED** (refused unless
+`HC_ALLOW_RAW=1`) and is for diagnostics only; never use it to dump table row contents.
 
 ### P2.2 Integrity ops (aggregate counts only — never row contents)
 
@@ -231,6 +253,7 @@ object to stdout. Exact flag names and output keys:
 
 | Check | Command | Output keys |
 |-------|---------|-------------|
+| Schema | `--op schema` (add `--table <t>` to scope; **no `HC_ALLOW_RAW`**) | `{"op":"schema","tables":[{"table","columns":[{"name","type","notnull","pk"}],"foreign_keys":[{"column","ref_table","ref_column"}]}]}` |
 | Row count | `--op rowcount --table <t>` (add `--exact` on `--deep` / Postgres) | `{"table","count","approximate"}` (Postgres adds `approximate`; SQLite is always exact) |
 | FK orphans | `--op fk_orphans --child <t> --column <fk> --parent <pt> --parent-column <pc>` | `{"op":"fk_orphans","child","column","parent","orphans"}` |
 | Duplicates | `--op duplicates --table <t> --column <unique_col>` | `{"op":"duplicates","table","column","duplicate_groups"}` |

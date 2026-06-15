@@ -234,3 +234,106 @@ def test_pg_ops_run_inside_read_only_txn_setup(monkeypatch):
     assert "set transaction read only" in joined
     # Never committed.
     assert fake_conn.rolled_back is True
+
+
+# --- audit ops (Task 4) -------------------------------------------------------
+#
+# The recording cursor returns fetchall()->[] and fetchone()->(0,). The audit
+# ops fold an empty result set without error, so these assert SQL SHAPE +
+# quoted-identifier interpolation + read-only setup, not row math (that is
+# covered by the sqlite-fixture suite in test_hc_db_audit.py).
+
+def _first_sql_containing(fake_conn: _RecordingConn, needle: str) -> str:
+    needle = needle.lower()
+    for sql, _params in fake_conn.executed:
+        if needle in sql.lower():
+            return sql
+    raise AssertionError(f"no statement containing {needle!r} in "
+                         f"{fake_conn.executed!r}")
+
+
+def test_pg_audit_user_summary_sql_shape_and_quoting(monkeypatch):
+    args = _base_args(op="audit_user_summary", table="audit_log",
+                      user_column="user_id", action_column="action")
+    fake_conn, result = _run_op(monkeypatch, args)
+    sql = _first_sql_containing(fake_conn, "group by")
+    assert '"audit_log"' in sql
+    assert '"user_id"' in sql
+    assert '"action"' in sql
+    assert "count(" in sql.lower()
+    assert "group by" in sql.lower()
+    assert _read_only_setup_ran_before(fake_conn, sql)
+    assert result["op"] == "audit_user_summary"
+    assert result["table"] == "audit_log"
+    assert result["users"] == []  # empty recording result folds to no users
+
+
+def test_pg_audit_velocity_sql_shape_param_order_and_quoting(monkeypatch):
+    args = _base_args(op="audit_velocity", table="audit_log",
+                      user_column="user_id", ts_column="ts",
+                      window_seconds=60, threshold=20)
+    fake_conn, result = _run_op(monkeypatch, args)
+    sql, params = _op_count_stmt(fake_conn)
+    assert '"audit_log"' in sql
+    assert '"user_id"' in sql
+    assert '"ts"' in sql
+    # Postgres epoch bucketing.
+    assert "extract(epoch from" in sql.lower()
+    assert "::bigint" in sql.lower()
+    assert "having" in sql.lower()
+    # PIN param order: (window, threshold) so a future edit can't swap them.
+    assert params == (60, 20)
+    assert _read_only_setup_ran_before(fake_conn, sql)
+    assert result["op"] == "audit_velocity"
+    assert result["window_seconds"] == 60
+    assert result["threshold"] == 20
+    assert result["bursts"] == []
+
+
+def test_pg_audit_fingerprint_sql_shape_and_quoting(monkeypatch):
+    args = _base_args(op="audit_fingerprint", table="audit_log",
+                      user_column="user_id", action_column="action")
+    fake_conn, result = _run_op(monkeypatch, args)
+    sql = _first_sql_containing(fake_conn, "group by")
+    assert '"audit_log"' in sql
+    assert '"user_id"' in sql
+    assert '"action"' in sql
+    assert "count(" in sql.lower()
+    assert _read_only_setup_ran_before(fake_conn, sql)
+    assert result["op"] == "audit_fingerprint"
+    assert result["users"] == []
+
+
+def test_pg_audit_recency_sql_shape_and_quoting(monkeypatch):
+    args = _base_args(op="audit_recency", table="audit_log", ts_column="ts")
+    fake_conn, result = _run_op(monkeypatch, args)
+    max_sql = _first_sql_containing(fake_conn, "max(")
+    interval_sql = _first_sql_containing(fake_conn, "make_interval")
+    assert '"audit_log"' in max_sql
+    assert '"ts"' in max_sql
+    assert '"ts"' in interval_sql
+    assert "make_interval(days => %s)" in interval_sql.lower()
+    # The 24h/7d count queries bind the day count.
+    day_params = [params for sql, params in fake_conn.executed
+                  if "make_interval" in sql.lower()]
+    assert (1,) in day_params
+    assert (7,) in day_params
+    assert _read_only_setup_ran_before(fake_conn, interval_sql)
+    assert result["op"] == "audit_recency"
+    assert result["table"] == "audit_log"
+
+
+def test_pg_audit_velocity_rejects_zero_window(monkeypatch):
+    args = _base_args(op="audit_velocity", table="audit_log",
+                      user_column="user_id", ts_column="ts",
+                      window_seconds=0, threshold=20)
+    with pytest.raises(SystemExit):
+        _run_op(monkeypatch, args)
+
+
+def test_pg_audit_velocity_rejects_zero_threshold(monkeypatch):
+    args = _base_args(op="audit_velocity", table="audit_log",
+                      user_column="user_id", ts_column="ts",
+                      window_seconds=60, threshold=0)
+    with pytest.raises(SystemExit):
+        _run_op(monkeypatch, args)

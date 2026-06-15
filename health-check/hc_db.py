@@ -156,6 +156,21 @@ def _require_non_negative_int(value: int | None, what: str) -> int:
     return value
 
 
+def _require_positive_int(value: int | None, what: str) -> int:
+    """Validate ``value`` is a present int >= 1 or fail closed.
+
+    Used for the velocity op's --window-seconds and --threshold, where a value
+    of 0 is meaningless (a zero-width window / a zero-event burst threshold).
+    """
+    if value is None:
+        _fail(f"{what} is required",
+              error_obj={"error": f"{what} is required"})
+    if value < 1:
+        _fail(f"{what} must be a positive integer >= 1 (got {value})",
+              error_obj={"error": f"{what} must be a positive integer >= 1"})
+    return value
+
+
 # --- SQLite path ---------------------------------------------------------------
 
 def _connect_sqlite_ro(db: str) -> sqlite3.Connection:
@@ -259,6 +274,128 @@ def _sqlite_stale(con: sqlite3.Connection, table: str, column: str, value: str,
             "stale": count}
 
 
+def _fold_user_actions(rows: list[tuple[Any, Any, int]]) -> list[dict[str, Any]]:
+    """Fold (user, action, count) rows into per-user nested action dicts.
+
+    Returns a list of ``{"user_id": u, "actions": {action: count, ...},
+    "total": n}`` sorted by total desc (stable for ties — preserves first-seen
+    user order within an equal total). Aggregate-only: only the user-identifier,
+    action label, and counts are present — never row contents.
+    """
+    folded: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
+    for user, action, count in rows:
+        bucket = folded.get(user)
+        if bucket is None:
+            bucket = {"user_id": user, "actions": {}, "total": 0}
+            folded[user] = bucket
+            order.append(user)
+        bucket["actions"][action] = bucket["actions"].get(action, 0) + int(count)
+        bucket["total"] += int(count)
+    users = [folded[u] for u in order]
+    users.sort(key=lambda b: b["total"], reverse=True)
+    return users
+
+
+def _sqlite_audit_user_summary(con: sqlite3.Connection, table: str,
+                               user_column: str,
+                               action_column: str) -> dict[str, Any]:
+    """Per-user action-type counts (aggregate-only GROUP BY user, action)."""
+    table = _require_identifier(table, "--table")
+    user_column = _require_identifier(user_column, "--user-column")
+    action_column = _require_identifier(action_column, "--action-column")
+    sql = (
+        f'SELECT "{user_column}", "{action_column}", COUNT(*) '
+        f'FROM "{table}" GROUP BY "{user_column}", "{action_column}"'
+    )
+    rows = [(r[0], r[1], int(r[2])) for r in con.execute(sql).fetchall()]
+    return {"op": "audit_user_summary", "table": table,
+            "users": _fold_user_actions(rows)}
+
+
+def _sqlite_audit_velocity(con: sqlite3.Connection, table: str,
+                           user_column: str, ts_column: str,
+                           window_seconds: int,
+                           threshold: int) -> dict[str, Any]:
+    """Flag per-user event bursts using fixed-width epoch buckets.
+
+    Each event is bucketed into ``floor(epoch(ts) / W)``; buckets with count
+    >= threshold are reported. Aggregate-only: groups by user + bucket and
+    selects only the user-identifier, the bucket, and the count.
+    """
+    table = _require_identifier(table, "--table")
+    user_column = _require_identifier(user_column, "--user-column")
+    ts_column = _require_identifier(ts_column, "--ts-column")
+    window = _require_positive_int(window_seconds, "--window-seconds")
+    thresh = _require_positive_int(threshold, "--threshold")
+    # SQLite epoch via strftime('%s', ...); bucket = epoch / W (integer div).
+    # window is a validated positive int — bound as a parameter all the same.
+    sql = (
+        f'SELECT "{user_column}", '
+        f'CAST(strftime(\'%s\', "{ts_column}") AS INTEGER) / ? AS bucket, '
+        f'COUNT(*) AS c '
+        f'FROM "{table}" '
+        f'GROUP BY "{user_column}", bucket '
+        f'HAVING c >= ? '
+        f'ORDER BY c DESC'
+    )
+    bursts: list[dict[str, Any]] = []
+    for user, bucket, count in con.execute(sql, (window, thresh)).fetchall():
+        bursts.append({
+            "user_id": user,
+            "count": int(count),
+            "bucket_start_epoch": int(bucket) * window,
+        })
+    bursts.sort(key=lambda b: b["count"], reverse=True)
+    return {"op": "audit_velocity", "table": table,
+            "window_seconds": window, "threshold": thresh, "bursts": bursts}
+
+
+def _sqlite_audit_fingerprint(con: sqlite3.Connection, table: str,
+                              user_column: str,
+                              action_column: str) -> dict[str, Any]:
+    """Per-user action-type distribution (thin wrapper over user_summary data)."""
+    table = _require_identifier(table, "--table")
+    user_column = _require_identifier(user_column, "--user-column")
+    action_column = _require_identifier(action_column, "--action-column")
+    sql = (
+        f'SELECT "{user_column}", "{action_column}", COUNT(*) '
+        f'FROM "{table}" GROUP BY "{user_column}", "{action_column}"'
+    )
+    rows = [(r[0], r[1], int(r[2])) for r in con.execute(sql).fetchall()]
+    users = [{"user_id": b["user_id"], "actions": b["actions"]}
+             for b in _fold_user_actions(rows)]
+    return {"op": "audit_fingerprint", "table": table, "users": users}
+
+
+def _sqlite_audit_recency(con: sqlite3.Connection, table: str,
+                          ts_column: str) -> dict[str, Any]:
+    """Last-write timestamp + 24h / 7d event counts.
+
+    Like the ``stale`` op, the 24h/7d comparisons run lexically against SQLite's
+    ``datetime('now', ...)`` output. This REQUIRES timestamps stored in canonical
+    ``YYYY-MM-DD HH:MM:SS`` format (as produced by SQLite's ``datetime()``).
+    ISO-8601 with a ``T`` separator or a timezone offset sorts lexically out of
+    order versus the canonical form and may yield WRONG counts. Postgres uses
+    typed timestamp comparison and has no such requirement.
+    """
+    table = _require_identifier(table, "--table")
+    ts_column = _require_identifier(ts_column, "--ts-column")
+    last_write = con.execute(
+        f'SELECT MAX("{ts_column}") FROM "{table}"').fetchone()[0]
+    events_24h = int(con.execute(
+        f'SELECT COUNT(*) FROM "{table}" '
+        f'WHERE "{ts_column}" >= datetime(\'now\', ?)', ("-1 day",)
+    ).fetchone()[0])
+    events_7d = int(con.execute(
+        f'SELECT COUNT(*) FROM "{table}" '
+        f'WHERE "{ts_column}" >= datetime(\'now\', ?)', ("-7 days",)
+    ).fetchone()[0])
+    return {"op": "audit_recency", "table": table,
+            "last_write_ts": last_write,
+            "events_24h": events_24h, "events_7d": events_7d}
+
+
 def _handle_sqlite(args: argparse.Namespace) -> dict[str, Any]:
     con = _connect_sqlite_ro(args.db)
     try:
@@ -282,6 +419,18 @@ def _handle_sqlite(args: argparse.Namespace) -> dict[str, Any]:
                       error_obj={"error": "--value is required for stale"})
             return _sqlite_stale(con, args.table, args.column, args.value,
                                  args.age_column, args.older_than_hours)
+        if args.op == "audit_user_summary":
+            return _sqlite_audit_user_summary(con, args.table, args.user_column,
+                                              args.action_column)
+        if args.op == "audit_velocity":
+            return _sqlite_audit_velocity(con, args.table, args.user_column,
+                                          args.ts_column, args.window_seconds,
+                                          args.threshold)
+        if args.op == "audit_fingerprint":
+            return _sqlite_audit_fingerprint(con, args.table, args.user_column,
+                                             args.action_column)
+        if args.op == "audit_recency":
+            return _sqlite_audit_recency(con, args.table, args.ts_column)
         _fail(f"unknown op: {args.op!r}",
               error_obj={"error": f"unknown op: {args.op}"})
     finally:
@@ -448,6 +597,93 @@ def _pg_stale(conn: Any, table: str, column: str, value: str, age_column: str,
             "stale": count}
 
 
+def _pg_audit_user_summary(conn: Any, table: str, user_column: str,
+                           action_column: str) -> dict[str, Any]:
+    """Per-user action-type counts (aggregate-only GROUP BY user, action)."""
+    table = _require_identifier(table, "--table")
+    user_column = _require_identifier(user_column, "--user-column")
+    action_column = _require_identifier(action_column, "--action-column")
+    sql = (
+        f'SELECT "{user_column}", "{action_column}", COUNT(*) '
+        f'FROM "{table}" GROUP BY "{user_column}", "{action_column}"'
+    )
+    rows = [(r[0], r[1], int(r[2])) for r in conn.execute(sql).fetchall()]
+    return {"op": "audit_user_summary", "table": table,
+            "users": _fold_user_actions(rows)}
+
+
+def _pg_audit_velocity(conn: Any, table: str, user_column: str, ts_column: str,
+                       window_seconds: int, threshold: int) -> dict[str, Any]:
+    """Flag per-user event bursts using fixed-width epoch buckets.
+
+    Each event is bucketed into ``floor(extract(epoch from ts) / W)``; buckets
+    with count >= threshold are reported. Aggregate-only.
+    """
+    table = _require_identifier(table, "--table")
+    user_column = _require_identifier(user_column, "--user-column")
+    ts_column = _require_identifier(ts_column, "--ts-column")
+    window = _require_positive_int(window_seconds, "--window-seconds")
+    thresh = _require_positive_int(threshold, "--threshold")
+    # window/threshold are validated positive ints — bound as parameters.
+    sql = (
+        f'SELECT "{user_column}", '
+        f'floor(extract(epoch from "{ts_column}"))::bigint / %s AS bucket, '
+        f'COUNT(*) AS c '
+        f'FROM "{table}" '
+        f'GROUP BY "{user_column}", bucket '
+        f'HAVING COUNT(*) >= %s '
+        f'ORDER BY c DESC'
+    )
+    bursts: list[dict[str, Any]] = []
+    for user, bucket, count in conn.execute(sql, (window, thresh)).fetchall():
+        bursts.append({
+            "user_id": user,
+            "count": int(count),
+            "bucket_start_epoch": int(bucket) * window,
+        })
+    bursts.sort(key=lambda b: b["count"], reverse=True)
+    return {"op": "audit_velocity", "table": table,
+            "window_seconds": window, "threshold": thresh, "bursts": bursts}
+
+
+def _pg_audit_fingerprint(conn: Any, table: str, user_column: str,
+                          action_column: str) -> dict[str, Any]:
+    """Per-user action-type distribution (thin wrapper over user_summary data)."""
+    table = _require_identifier(table, "--table")
+    user_column = _require_identifier(user_column, "--user-column")
+    action_column = _require_identifier(action_column, "--action-column")
+    sql = (
+        f'SELECT "{user_column}", "{action_column}", COUNT(*) '
+        f'FROM "{table}" GROUP BY "{user_column}", "{action_column}"'
+    )
+    rows = [(r[0], r[1], int(r[2])) for r in conn.execute(sql).fetchall()]
+    users = [{"user_id": b["user_id"], "actions": b["actions"]}
+             for b in _fold_user_actions(rows)]
+    return {"op": "audit_fingerprint", "table": table, "users": users}
+
+
+def _pg_audit_recency(conn: Any, table: str, ts_column: str) -> dict[str, Any]:
+    """Last-write timestamp + 24h / 7d event counts (typed timestamp compare)."""
+    table = _require_identifier(table, "--table")
+    ts_column = _require_identifier(ts_column, "--ts-column")
+    last_write = conn.execute(
+        f'SELECT MAX("{ts_column}") FROM "{table}"').fetchone()[0]
+    events_24h = int(conn.execute(
+        f'SELECT COUNT(*) FROM "{table}" '
+        f'WHERE "{ts_column}" >= now() - make_interval(days => %s)', (1,)
+    ).fetchone()[0])
+    events_7d = int(conn.execute(
+        f'SELECT COUNT(*) FROM "{table}" '
+        f'WHERE "{ts_column}" >= now() - make_interval(days => %s)', (7,)
+    ).fetchone()[0])
+    # MAX() of a timestamp comes back as a datetime; serialize to ISO for JSON.
+    if last_write is not None and hasattr(last_write, "isoformat"):
+        last_write = last_write.isoformat()
+    return {"op": "audit_recency", "table": table,
+            "last_write_ts": last_write,
+            "events_24h": events_24h, "events_7d": events_7d}
+
+
 def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
     """Postgres read-only handler.
 
@@ -529,6 +765,18 @@ def _handle_postgres(args: argparse.Namespace) -> dict[str, Any]:
                       error_obj={"error": "--value is required for stale"})
             result = _pg_stale(conn, args.table, args.column, args.value,
                                args.age_column, args.older_than_hours)
+        elif args.op == "audit_user_summary":
+            result = _pg_audit_user_summary(conn, args.table, args.user_column,
+                                            args.action_column)
+        elif args.op == "audit_velocity":
+            result = _pg_audit_velocity(conn, args.table, args.user_column,
+                                        args.ts_column, args.window_seconds,
+                                        args.threshold)
+        elif args.op == "audit_fingerprint":
+            result = _pg_audit_fingerprint(conn, args.table, args.user_column,
+                                           args.action_column)
+        elif args.op == "audit_recency":
+            result = _pg_audit_recency(conn, args.table, args.ts_column)
         else:
             _fail(f"unknown op: {args.op!r}",
                   error_obj={"error": f"unknown op: {args.op}"})
@@ -594,6 +842,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--older-than-hours", type=int, default=None,
                         help="Age threshold in hours for the stale op. Must be a "
                              "non-negative integer.")
+    parser.add_argument("--user-column", default=None,
+                        help="User-identifier column for audit ops "
+                             "(audit_user_summary, audit_velocity, "
+                             "audit_fingerprint).")
+    parser.add_argument("--action-column", default=None,
+                        help="Action-type column for audit_user_summary / "
+                             "audit_fingerprint.")
+    parser.add_argument("--ts-column", default=None,
+                        help="Timestamp column for audit_velocity / "
+                             "audit_recency. SQLite audit_recency requires "
+                             "timestamps in canonical 'YYYY-MM-DD HH:MM:SS' "
+                             "format (see --age-column note); Postgres uses "
+                             "typed timestamp comparison.")
+    parser.add_argument("--window-seconds", type=int, default=None,
+                        help="Rolling/bucketed window width in seconds for "
+                             "audit_velocity. Must be a positive integer >= 1.")
+    parser.add_argument("--threshold", type=int, default=None,
+                        help="Burst threshold for audit_velocity: report buckets "
+                             "with event count >= this. Must be >= 1.")
     parser.add_argument("--raw", default=None,
                         help="Raw SQL escape hatch. Still SELECT-only guarded.")
     parser.add_argument("--exact", action="store_true",

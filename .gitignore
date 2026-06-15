@@ -63,6 +63,8 @@ health-check/.pytest_cache/
 health-check/tests/__pycache__/
 health-check/row-counts.json
 health-check/out/
+health-check/.po.env
+health-check/*.env
 
 # Personal config files (use .example templates for public repo)
 CLAUDE.md

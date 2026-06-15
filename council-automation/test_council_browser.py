@@ -12,7 +12,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Ensure council_config is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
-from council_browser import PerplexityCouncil, _load_selectors
+from council_browser import PerplexityCouncil, _load_selectors, _cf_hostname_match
+
+
+def test_cf_hostname_match_detects_challenge_host():
+    """Structured hostname check matches the Cloudflare challenge iframe host."""
+    assert _cf_hostname_match("https://challenges.cloudflare.com/turnstile/v0/api.js")
+    assert _cf_hostname_match("https://abc.challenges.cloudflare.com/x")
+    assert _cf_hostname_match("https://foo.cloudflare.com/y")
+
+
+def test_cf_hostname_match_rejects_spoofs_and_blanks():
+    """The substring-spoof cases the old `domain in html` check failed on."""
+    assert not _cf_hostname_match("https://challenges.cloudflare.com.evil.com/x")
+    assert not _cf_hostname_match("https://evil.com/?u=challenges.cloudflare.com")
+    assert not _cf_hostname_match("")
+    assert not _cf_hostname_match("about:blank")
+    assert not _cf_hostname_match("not a url")
 
 
 def test_load_selectors_from_file():

@@ -166,14 +166,16 @@ Output: `{"op":"connections","current":N,"max":M,"available":M-N}` (under the RE
 
 ### P0.4.6 RLS sanity note (Postgres — make sure the audit can actually see rows)
 
-Recommend running the audit with a role that can read all rows — a `pg_read_all_data` role
-(PG14+, bypasses RLS) or the table owner. Row-Level Security can silently hide rows from an
-ordinary role, making a healthy DB look empty.
+Recommend running the audit with a role that can read all rows. **Important: `pg_read_all_data`
+alone does NOT bypass RLS** — the role also needs `ALTER ROLE ... WITH BYPASSRLS` (the
+`--provision` output includes this). On Supabase, RLS is on by default, so an audit role
+without BYPASSRLS reads **zero rows** on protected tables. The table owner / `postgres` also
+sees all rows. Row-Level Security otherwise silently hides rows, making a healthy DB look empty.
 
 After schema discovery (P2.1), **verify a known non-empty table reports rows** — its
 `n_live_tup`/`reltuples` (or `--exact` count) should be `> 0`. **If every table reads as
 empty, WARN that RLS may be hiding rows from the audit role** and recommend re-running with a
-`pg_read_all_data`/owner role (generate one via `--provision`).
+`BYPASSRLS`/owner role (generate one via `--provision`).
 
 ### P0.5 Single confirmation prompt (the ONE gate)
 

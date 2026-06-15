@@ -77,10 +77,12 @@ def gen_readonly_role(role: str = "healthcheck_ro", schema: str = "public") -> s
       * creates ``role`` idempotently via a ``DO $$ ... $$`` block that checks
         ``pg_roles`` first (Postgres has no ``CREATE ROLE IF NOT EXISTS``), with
         a placeholder password the operator MUST change before running;
-      * grants the built-in ``pg_read_all_data`` role (PG14+) — this grants
-        SELECT on all tables AND bypasses RLS so audits see all rows;
+      * grants the built-in ``pg_read_all_data`` role (PG14+) for SELECT on all
+        tables, then ``ALTER ROLE ... WITH BYPASSRLS`` so the audit can see
+        RLS-protected rows (pg_read_all_data alone does NOT bypass RLS; on
+        Supabase, RLS is on by default so without this the role reads 0 rows);
       * falls back, for PostgreSQL < 14, to explicit ``USAGE`` + ``SELECT`` +
-        ``ALTER DEFAULT PRIVILEGES`` grants (these do NOT bypass RLS).
+        ``ALTER DEFAULT PRIVILEGES`` grants (also non-bypassing).
 
     It contains NO write grants (no INSERT/UPDATE/DELETE/ALL PRIVILEGES).
 
@@ -107,8 +109,13 @@ BEGIN
 END
 $$;
 
--- PG14+: pg_read_all_data grants SELECT on all tables AND bypasses RLS (audits see all rows). Preferred.
+-- PG14+: pg_read_all_data grants SELECT on every table/view/sequence. Preferred over per-table grants.
 GRANT pg_read_all_data TO "{role}";
+
+-- REQUIRED for the audit to see RLS-protected rows. pg_read_all_data does NOT bypass RLS;
+-- on Supabase (RLS on by default) an audit role without BYPASSRLS reads ZERO rows on protected tables.
+-- Keep this role's credentials private (never in client/browser code).
+ALTER ROLE "{role}" WITH BYPASSRLS;
 
 -- Fallback for PostgreSQL < 14 (no pg_read_all_data) - explicit read grants; NOTE: these do NOT bypass RLS:
 GRANT USAGE ON SCHEMA "{schema}" TO "{role}";

@@ -44,17 +44,18 @@ def test_readonly_role_contains_required_statements():
     assert '"public"' in sql
 
 
-def test_readonly_role_grants_pg_read_all_data_with_rls_note():
-    """PG14+ path: grant the built-in pg_read_all_data role with an RLS-bypass
-    comment so an audit role sees all rows (RLS would otherwise hide them)."""
+def test_readonly_role_grants_pg_read_all_data_with_bypassrls():
+    """PG14+ path: grant pg_read_all_data AND ALTER ROLE ... WITH BYPASSRLS so
+    the audit sees RLS-protected rows. pg_read_all_data alone does NOT bypass
+    RLS, so without BYPASSRLS a Supabase audit role would read zero rows."""
     sql = gen_readonly_role()
     low = sql.lower()
     # The preferred PG14+ grant.
     assert "grant pg_read_all_data" in low
-    # RLS-bypass note (preferred path bypasses RLS).
-    assert "bypasses rls" in low
-    # Fallback path is explicitly called out as NOT bypassing RLS.
-    assert "do not bypass rls" in low or "not bypass rls" in low
+    # BYPASSRLS is required and must be emitted (the actual RLS fix).
+    assert "bypassrls" in low
+    # The comment must NOT falsely claim pg_read_all_data bypasses RLS.
+    assert "does not bypass rls" in low or "not bypass rls" in low
     assert "postgresql < 14" in low or "pg < 14" in low or "< 14" in low
 
 

@@ -53,6 +53,13 @@
     },
     "notes": "pillar_axis controls log orientation. y is upright."
   },
+  "spruce_log": {
+    "id": "minecraft:spruce_log",
+    "states": {
+      "pillar_axis": "x | y | z (orientation of the log/pillar)"
+    },
+    "notes": "Darker log; good trim/accent. pillar_axis controls orientation."
+  },
   "oak_stairs": {
     "id": "minecraft:oak_stairs",
     "states": {
@@ -93,6 +100,11 @@
     "id": "minecraft:white_concrete",
     "states": {},
     "notes": "Solid hardened concrete. Color in id."
+  },
+  "lime_concrete": {
+    "id": "minecraft:lime_concrete",
+    "states": {},
+    "notes": "Solid hardened concrete (lime/green). Color is part of the id."
   },
   "quartz_block": {
     "id": "minecraft:quartz_block",

@@ -11,6 +11,10 @@ import re
 
 _BLOCK_RE = re.compile(r"^(minecraft:)?[a-z0-9_]+$")
 _STATE_KEY_RE = re.compile(r"^[a-z0-9_:]+$")
+# Bedrock string-state values are enum tokens (e.g. "top", "minecraft:north").
+# Validate them too — an unvalidated value like '"]; setblock ...' would break out
+# of the quotes/brackets and inject a live command.
+_STATE_STR_VALUE_RE = re.compile(r"^[a-z0-9_:]+$")
 
 
 def _serialize_value(value: bool | int | str) -> str:
@@ -24,6 +28,8 @@ def _serialize_value(value: bool | int | str) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, str):
+        if not _STATE_STR_VALUE_RE.match(value):
+            raise ValueError(f"Invalid state value (injection-unsafe): {value!r}")
         return f'"{value}"'
     raise ValueError(f"Unsupported state value type: {type(value).__name__}")
 

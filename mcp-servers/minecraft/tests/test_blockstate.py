@@ -25,6 +25,14 @@ def test_empty_states_dict_is_plain():
     assert serialize_block("stone", {}) == "stone"
 
 
+def test_rejects_injection_in_string_value():
+    # A malicious string value must NOT break out of the quotes/brackets.
+    with pytest.raises(ValueError):
+        serialize_block("command_block", {"k": '"]; setblock ~ ~ ~ tnt; #'})
+    with pytest.raises(ValueError):
+        serialize_block("stone", {"k": "a]b"})
+
+
 def test_rejects_injection_in_block_name():
     with pytest.raises(ValueError):
         serialize_block("stone; say hi")

@@ -40,3 +40,4 @@ jobs:
             --cov-report=term-missing \
             --cov-fail-under=60
           pytest health-check/tests/ -v
+          pytest mcp-servers/minecraft/tests/ -v

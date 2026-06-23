@@ -27,6 +27,8 @@
 !mcp-servers/
 !mcp-servers/browser-bridge/
 !mcp-servers/browser-bridge/**
+!mcp-servers/minecraft/
+!mcp-servers/minecraft/**
 !automated-loop/
 !automated-loop/**
 !patterns/
@@ -46,6 +48,9 @@
 council-automation/__pycache__/
 mcp-servers/browser-bridge/node_modules/
 mcp-servers/browser-bridge/package-lock.json
+mcp-servers/minecraft/__pycache__/
+mcp-servers/minecraft/**/__pycache__/
+mcp-servers/minecraft/.pytest_cache/
 
 # Automated loop runtime exclusions
 automated-loop/__pycache__/

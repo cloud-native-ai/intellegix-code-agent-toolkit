@@ -40,6 +40,7 @@ from bedrock.server import Server
 from fastmcp import Context, FastMCP
 from websockets import server as wss
 
+import mcs_build
 from mc_session import McSession
 
 logger = logging.getLogger(__name__)
@@ -181,6 +182,157 @@ def connect_status(ctx: Context) -> dict[str, Any]:
             "port": LISTEN_PORT,
         }
     return session.status()
+
+
+def _require_session() -> McSession:
+    """Return the live :class:`McSession`, or raise if the listener isn't up.
+
+    Returns:
+        The module-level :class:`McSession` built by the lifespan.
+
+    Raises:
+        RuntimeError: If the session is not yet constructed (lifespan not run).
+    """
+    if _SESSION is None:
+        raise RuntimeError(
+            "Bedrock listener not started; the MCP lifespan has not run yet."
+        )
+    return _SESSION
+
+
+@mcp.tool
+async def run_command(command: str) -> dict[str, Any]:
+    """Run a raw Minecraft Bedrock slash-command on the connected client.
+
+    Args:
+        command: The command text (with or without a leading ``/``). Must be a
+            non-blank string.
+
+    Returns:
+        ``{"ok": bool, "status_code": int, "message": str}`` from the Bedrock
+        command response.
+
+    Raises:
+        ValueError: If ``command`` is blank/whitespace-only.
+        RuntimeError: If no Bedrock listener session is available.
+    """
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("command must be a non-empty string")
+    res = await _require_session().run(command)
+    return {"ok": res.ok, "status_code": res.status_code, "message": res.message}
+
+
+@mcp.tool
+async def setblock(
+    x: int,
+    y: int,
+    z: int,
+    block: str,
+    states: Optional[dict] = None,
+    relative_to_player: bool = False,
+) -> dict[str, Any]:
+    """Place a single block via Bedrock ``/setblock``.
+
+    Args:
+        x, y, z: Target coordinates (absolute, or player-relative when
+            ``relative_to_player`` is True).
+        block: Block id, e.g. ``stone`` or ``minecraft:oak_stairs``.
+        states: Optional block-state mapping (e.g. ``{"weirdo_direction": 0}``).
+        relative_to_player: Run relative to the connected player's position.
+
+    Returns:
+        ``{"ok": bool, "status_code": int, "message": str, "command": str}`` —
+        the command response plus the exact command that was run.
+
+    Raises:
+        ValueError: If the block name or states are injection-unsafe.
+        RuntimeError: If no Bedrock listener session is available.
+    """
+    cmd = mcs_build.setblock_command(
+        x, y, z, block, states=states, relative_to_player=relative_to_player
+    )
+    res = await _require_session().run(cmd)
+    return {
+        "ok": res.ok,
+        "status_code": res.status_code,
+        "message": res.message,
+        "command": cmd,
+    }
+
+
+@mcp.tool
+async def fill(
+    x1: int,
+    y1: int,
+    z1: int,
+    x2: int,
+    y2: int,
+    z2: int,
+    block: str,
+    states: Optional[dict] = None,
+    mode: str = "replace",
+    relative_to_player: bool = False,
+) -> dict[str, Any]:
+    """Fill a 3D region via Bedrock ``/fill``, chunked to respect the fill cap.
+
+    The region is split into sub-boxes (each within Bedrock's fill cap) and each
+    resulting command is run in turn; results are aggregated.
+
+    Args:
+        x1, y1, z1: One corner of the region (absolute, or player-relative when
+            ``relative_to_player`` is True).
+        x2, y2, z2: The opposite corner.
+        block: Block id to fill with.
+        states: Optional block-state mapping (e.g. ``{"pillar_axis": "y"}``).
+        mode: Fill mode — one of ``replace`` (default), ``hollow``, ``outline``,
+            ``keep``, ``destroy``.
+        relative_to_player: Run relative to the connected player's position.
+
+    Returns:
+        ``{"ok": bool, "chunks": int, "failed": list[dict], "first_error":
+        str | None}``. ``ok`` is True only when every chunk succeeded;
+        ``failed`` lists each non-ok chunk's command/status/message;
+        ``first_error`` surfaces the first non-zero status message.
+
+    Raises:
+        ValueError: If ``mode`` is invalid or the block/states are unsafe.
+        RuntimeError: If no Bedrock listener session is available.
+    """
+    cmds = mcs_build.fill_commands(
+        x1,
+        y1,
+        z1,
+        x2,
+        y2,
+        z2,
+        block,
+        states=states,
+        mode=mode,
+        relative_to_player=relative_to_player,
+    )
+    session = _require_session()
+
+    failed: list[dict[str, Any]] = []
+    first_error: Optional[str] = None
+    for cmd in cmds:
+        res = await session.run(cmd)
+        if not res.ok:
+            failed.append(
+                {
+                    "command": cmd,
+                    "status_code": res.status_code,
+                    "message": res.message,
+                }
+            )
+            if first_error is None:
+                first_error = res.message
+
+    return {
+        "ok": not failed,
+        "chunks": len(cmds),
+        "failed": failed,
+        "first_error": first_error,
+    }
 
 
 if __name__ == "__main__":

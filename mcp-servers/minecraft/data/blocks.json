@@ -64,9 +64,10 @@
   "stone_block_slab": {
     "id": "minecraft:stone_block_slab",
     "states": {
-      "minecraft:vertical_half": "bottom | top (current Bedrock slab placement state)"
+      "top_slot_bit": "false=bottom slab, true=top slab (standard top/bottom placement)",
+      "minecraft:vertical_half": "separate VERTICAL-slab orientation state (bottom|top) on newer vertical-slab variants — not the same as top_slot_bit"
     },
-    "notes": "Modern Bedrock uses the namespaced state minecraft:vertical_half (bottom/top) for slab placement; the legacy top_slot_bit is deprecated. stone_block_slab is the stone slab id family."
+    "notes": "stone_block_slab is the stone slab id family. Use top_slot_bit for bottom/top placement. Do NOT confuse with minecraft:vertical_half (vertical slabs). TODO: verify exact current slab states against Bedrock docs in the deferred Perplexity Run 3."
   },
   "glass": {
     "id": "minecraft:glass",

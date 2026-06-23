@@ -1,0 +1,179 @@
+{
+  "stone": {
+    "id": "minecraft:stone",
+    "states": {},
+    "notes": "Basic full block. Solid grey building stone."
+  },
+  "cobblestone": {
+    "id": "minecraft:cobblestone",
+    "states": {},
+    "notes": "Rough variant of stone."
+  },
+  "stone_bricks": {
+    "id": "minecraft:stone_bricks",
+    "states": {},
+    "notes": "Bedrock id is stone_bricks (plural). Variants via separate ids (mossy/cracked/chiseled) in modern Bedrock, not a state."
+  },
+  "deepslate": {
+    "id": "minecraft:deepslate",
+    "states": {
+      "pillar_axis": "x | y | z (rotated pillar-style block, like logs)"
+    },
+    "notes": "Dark deep-underground stone. Has pillar_axis like a log."
+  },
+  "polished_andesite": {
+    "id": "minecraft:polished_andesite",
+    "states": {},
+    "notes": "Smooth grey decorative stone."
+  },
+  "dirt": {
+    "id": "minecraft:dirt",
+    "states": {},
+    "notes": "Plain dirt."
+  },
+  "grass_block": {
+    "id": "minecraft:grass_block",
+    "states": {},
+    "notes": "Bedrock id is grass_block (not just 'grass', which is the plant/short_grass)."
+  },
+  "oak_planks": {
+    "id": "minecraft:oak_planks",
+    "states": {},
+    "notes": "Oak wood planks. Wood-type variants are separate ids in modern Bedrock (spruce_planks etc)."
+  },
+  "spruce_planks": {
+    "id": "minecraft:spruce_planks",
+    "states": {},
+    "notes": "Spruce wood planks."
+  },
+  "oak_log": {
+    "id": "minecraft:oak_log",
+    "states": {
+      "pillar_axis": "x | y | z (orientation of the log/pillar)"
+    },
+    "notes": "pillar_axis controls log orientation. y is upright."
+  },
+  "spruce_log": {
+    "id": "minecraft:spruce_log",
+    "states": {
+      "pillar_axis": "x | y | z (orientation of the log/pillar)"
+    },
+    "notes": "Darker log; good trim/accent. pillar_axis controls orientation."
+  },
+  "oak_stairs": {
+    "id": "minecraft:oak_stairs",
+    "states": {
+      "weirdo_direction": "0 | 1 | 2 | 3 (the facing of the stairs - Bedrock's quirky name for stair direction)",
+      "upside_down_bit": "0 | 1 (0 = right-side-up, 1 = upside-down/top-half)"
+    },
+    "notes": "Bedrock stairs use weirdo_direction + upside_down_bit, NOT Java's 'facing'/'half'."
+  },
+  "stone_block_slab": {
+    "id": "minecraft:stone_block_slab",
+    "states": {
+      "top_slot_bit": "false=bottom slab, true=top slab (standard top/bottom placement)",
+      "minecraft:vertical_half": "separate VERTICAL-slab orientation state (bottom|top) on newer vertical-slab variants — not the same as top_slot_bit"
+    },
+    "notes": "stone_block_slab is the stone slab id family. Use top_slot_bit for bottom/top placement. Do NOT confuse with minecraft:vertical_half (vertical slabs). TODO: verify exact current slab states against Bedrock docs in the deferred Perplexity Run 3."
+  },
+  "glass": {
+    "id": "minecraft:glass",
+    "states": {},
+    "notes": "Clear glass block."
+  },
+  "pink_stained_glass": {
+    "id": "minecraft:pink_stained_glass",
+    "states": {},
+    "notes": "Color is part of the id in modern Bedrock, not a 'color' state."
+  },
+  "pink_wool": {
+    "id": "minecraft:pink_wool",
+    "states": {},
+    "notes": "Color is part of the id (pink_wool), not a color data value, in modern Bedrock."
+  },
+  "pink_concrete": {
+    "id": "minecraft:pink_concrete",
+    "states": {},
+    "notes": "Solid hardened concrete. Color in id."
+  },
+  "white_concrete": {
+    "id": "minecraft:white_concrete",
+    "states": {},
+    "notes": "Solid hardened concrete. Color in id."
+  },
+  "lime_concrete": {
+    "id": "minecraft:lime_concrete",
+    "states": {},
+    "notes": "Solid hardened concrete (lime/green). Color is part of the id."
+  },
+  "quartz_block": {
+    "id": "minecraft:quartz_block",
+    "states": {},
+    "notes": "Clean white quartz building block."
+  },
+  "gold_block": {
+    "id": "minecraft:gold_block",
+    "states": {},
+    "notes": "Solid gold block."
+  },
+  "diamond_block": {
+    "id": "minecraft:diamond_block",
+    "states": {},
+    "notes": "Solid diamond block."
+  },
+  "glowstone": {
+    "id": "minecraft:glowstone",
+    "states": {},
+    "notes": "Emits full light level 15."
+  },
+  "sea_lantern": {
+    "id": "minecraft:sea_lantern",
+    "states": {},
+    "notes": "Bright underwater-style light source, light level 15."
+  },
+  "torch": {
+    "id": "minecraft:torch",
+    "states": {
+      "torch_facing_direction": "unknown | west | east | north | south | top (Bedrock torch attachment side)"
+    },
+    "notes": "Bedrock torch uses torch_facing_direction (string enum). 'top' = standing on floor."
+  },
+  "golden_rail": {
+    "id": "minecraft:golden_rail",
+    "states": {
+      "rail_direction": "0-5 (straight/ascending orientations; powered rail has no curved values 6-9)",
+      "rail_data_bit": "0 | 1 (0 = unpowered, 1 = powered/active)"
+    },
+    "notes": "GOTCHA: Bedrock powered rail is golden_rail, NOT powered_rail. Uses rail_direction + rail_data_bit."
+  },
+  "rail": {
+    "id": "minecraft:rail",
+    "states": {
+      "rail_direction": "0-9 (0-5 straight/ascending, 6-9 curved; regular rail supports curves)"
+    },
+    "notes": "Plain rail supports curved rail_direction values 6-9 unlike golden_rail."
+  },
+  "oak_door": {
+    "id": "minecraft:oak_door",
+    "states": {
+      "direction": "0 | 1 | 2 | 3 (hinge/facing direction)",
+      "open_bit": "0 | 1 (0 = closed, 1 = open)",
+      "upper_block_bit": "0 | 1 (0 = lower half, 1 = upper half)"
+    },
+    "notes": "Doors are two blocks: place lower then upper. upper_block_bit distinguishes the halves."
+  },
+  "ladder": {
+    "id": "minecraft:ladder",
+    "states": {
+      "facing_direction": "2 | 3 | 4 | 5 (north/south/west/east - the wall the ladder is attached to)"
+    },
+    "notes": "Bedrock facing_direction integer enum (0=down,1=up,2=north,3=south,4=west,5=east). Ladder must attach to a wall (2-5)."
+  },
+  "pink_glazed_terracotta": {
+    "id": "minecraft:pink_glazed_terracotta",
+    "states": {
+      "facing_direction": "2 | 3 | 4 | 5 (pattern orientation; integer enum)"
+    },
+    "notes": "Glazed terracotta has a directional pattern; color is part of the id."
+  }
+}

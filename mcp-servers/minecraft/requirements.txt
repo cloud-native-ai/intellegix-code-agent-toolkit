@@ -1,0 +1,11 @@
+# Minecraft Bedrock MCP server dependencies
+#
+# bedrockpy is PINNED to 1.0.1: server.py couples to bedrockpy internals
+# (the private `_websocket_handler` and `_loop` attributes), so a newer
+# release could rename/remove them and silently break the WS bridge.
+# bedrockpy 1.0.1 itself pins websockets to the 11.x line, so the bound
+# below (>=11,<12) matches what bedrockpy expects — do not bump past 12
+# without re-checking server.py against the new bedrockpy internals.
+fastmcp>=3.3
+bedrockpy==1.0.1
+websockets>=11,<12

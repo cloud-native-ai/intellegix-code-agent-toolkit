@@ -38,6 +38,13 @@ from typing import Any, Optional
 
 from bedrock.server import Server
 from fastmcp import Context, FastMCP
+
+try:
+    from fastmcp import Image  # FastMCP image-return type → model vision input
+except ImportError:  # pragma: no cover - fastmcp Image location varies by version
+    from fastmcp.utilities.types import Image
+
+import vision  # CI-safe screen-capture helper (heavy deps imported lazily)
 from websockets import server as wss
 
 import mcs_build
@@ -342,6 +349,100 @@ async def fill(
         "failed": failed,
         "first_error": first_error,
     }
+
+
+@mcp.tool
+def take_screenshot(
+    window_title_substring: Optional[str] = None,
+    region: Optional[tuple[int, int, int, int]] = None,
+    monitor: int = 1,
+) -> Image:
+    """Capture a screenshot so the model can SEE the build, returned as an image.
+
+    IMPORTANT — the Bedrock world renders on the iPhone, not this PC, and the
+    Bedrock WebSocket cannot return images. This captures whatever WINDOW on the
+    PC is showing the game: a second PC Bedrock client joined to the same world
+    (recommended), or an AirPlay mirror of the iPhone. Point it at that window by
+    title, or pass an explicit pixel region, or capture a whole monitor.
+
+    For structural truth that does NOT depend on a window (does the build match
+    the plan?), prefer :func:`verify_blocks` — a screenshot can be stale or
+    obscured by mobile UI while block-state checks stay correct.
+
+    Args:
+        window_title_substring: Capture the first visible window whose title
+            contains this (e.g. ``"Minecraft"`` for a PC client, or your AirPlay
+            receiver app's window title for a mirrored iPhone).
+        region: ``(left, top, width, height)`` pixels to capture instead.
+        monitor: 1-based monitor index for a full-monitor capture when neither of
+            the above is given (1 = primary).
+
+    Returns:
+        A PNG :class:`fastmcp.Image` delivered to the model as vision input.
+
+    Raises:
+        RuntimeError: If capture deps (``mss``/``pygetwindow``) are missing or no
+            visible window matches ``window_title_substring``.
+        ValueError: If ``region`` has a non-positive dimension.
+    """
+    png = vision.capture(
+        window_title_substring=window_title_substring,
+        region=region,
+        monitor=monitor,
+    )
+    return Image(data=png, format="png")
+
+
+@mcp.tool
+async def verify_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Verify specific blocks are actually placed — world-state "vision" over WS.
+
+    The robust feedback channel for this phone-rendered topology: instead of
+    pixels, ask the world for the truth. Runs Bedrock ``/testforblock`` per entry
+    (a success means the block at that position matches the expected id), so the
+    model can confirm a build landed as planned regardless of where — or whether
+    — it is being rendered.
+
+    Args:
+        blocks: List (≤256) of ``{"x": int, "y": int, "z": int, "block": str}``
+            entries; block id may be bare (``stone``) or namespaced
+            (``minecraft:oak_stairs``).
+
+    Returns:
+        ``{"checked": int, "matched": int, "mismatched": list[dict]}`` — each
+        mismatch carries its coords, the expected block, and the Bedrock message.
+
+    Raises:
+        ValueError: If ``blocks`` is empty, too large, or an entry is malformed
+            or has an injection-unsafe block id.
+        RuntimeError: If no Bedrock listener session is available.
+    """
+    import re
+
+    if not isinstance(blocks, list) or not blocks:
+        raise ValueError("blocks must be a non-empty list")
+    if len(blocks) > 256:
+        raise ValueError("at most 256 blocks per call")
+
+    session = _require_session()
+    matched = 0
+    mismatched: list[dict[str, Any]] = []
+    for b in blocks:
+        try:
+            x, y, z = int(b["x"]), int(b["y"]), int(b["z"])
+            block = str(b["block"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"bad block entry {b!r}: {exc}") from exc
+        if not re.fullmatch(r"[A-Za-z0-9_:]+", block):
+            raise ValueError(f"injection-unsafe block id: {block!r}")
+        res = await session.run(f"testforblock {x} {y} {z} {block}")
+        if res.ok:
+            matched += 1
+        else:
+            mismatched.append(
+                {"x": x, "y": y, "z": z, "expected": block, "message": res.message}
+            )
+    return {"checked": len(blocks), "matched": matched, "mismatched": mismatched}
 
 
 if __name__ == "__main__":

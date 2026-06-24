@@ -9,3 +9,10 @@
 fastmcp>=3.3
 bedrockpy==1.0.1
 websockets>=11,<12
+
+# Vision tools (take_screenshot). mss ships its own PNG encoder (no Pillow
+# needed); pygetwindow targets a specific window by title. Windows/macOS only —
+# vision.py lazy-imports both inside the capture functions, so CI (which installs
+# none of these) still imports the pure helpers fine.
+mss>=9
+pygetwindow>=0.0.9

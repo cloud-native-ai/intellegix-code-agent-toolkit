@@ -130,7 +130,14 @@ async def lifespan(server: FastMCP) -> AsyncIterator[McSession]:
     import asyncio
 
     ws_server = await wss.serve(
-        bedrock_server._websocket_handler, host=LISTEN_HOST, port=LISTEN_PORT
+        bedrock_server._websocket_handler,
+        host=LISTEN_HOST,
+        port=LISTEN_PORT,
+        # Minecraft Bedrock's WS client does NOT reply to protocol-level pings,
+        # so the websockets default keepalive (ping every 20s, 20s timeout)
+        # force-closes the connection with 1011 "keepalive ping timeout".
+        # Disable server-initiated pings; Minecraft manages its own liveness.
+        ping_interval=None,
     )
     bedrock_server._loop = asyncio.get_event_loop()
     bedrock_server._dispatch_server_event(

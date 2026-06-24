@@ -48,7 +48,7 @@ class McSession:
         player: The connected player's name, or ``None`` when disconnected.
     """
 
-    def __init__(self, sender: Optional[Sender] = None, port: int = 8765) -> None:
+    def __init__(self, sender: Optional[Sender] = None, port: int = 8767) -> None:
         """Create a session.
 
         Args:

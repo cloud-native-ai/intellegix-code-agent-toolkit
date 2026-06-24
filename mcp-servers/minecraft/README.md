@@ -41,13 +41,13 @@ Replace `<abs path>` with the absolute path to this repo on your machine.
 
 ## One-time PC setup
 
-### 1. Windows firewall — allow inbound on 8765
+### 1. Windows firewall — allow inbound on 8767
 
-The server binds `0.0.0.0:8765`. Open that port for inbound TCP on your **Private**
+The server binds `0.0.0.0:8767`. Open that port for inbound TCP on your **Private**
 network profile (run PowerShell as Administrator):
 
 ```powershell
-New-NetFirewallRule -DisplayName "MC Bedrock WS" -Direction Inbound -Protocol TCP -LocalPort 8765 -Action Allow -Profile Private
+New-NetFirewallRule -DisplayName "MC Bedrock WS" -Direction Inbound -Protocol TCP -LocalPort 8767 -Action Allow -Profile Private
 ```
 
 ### 2. Find the PC's LAN IP
@@ -89,7 +89,7 @@ Start the MCP server (Claude launches it, or run `python server.py` to test), th
 the Minecraft chat:
 
 ```
-/connect <PC-LAN-IP>:8765/ws
+/connect <PC-LAN-IP>:8767/ws
 ```
 
 Get `<PC-LAN-IP>` from `ipconfig`. On success the world is now driveable from Claude.
@@ -116,8 +116,8 @@ wraps the command in `execute as @p at @s run ... ~ ~ ~ ...`. Use it for "build 
 **"Could not connect" / `/connect` does nothing** — check, in order:
 
 1. **iOS Local Network permission** is ON for Minecraft (most common cause).
-2. **Firewall** inbound rule for TCP 8765 exists (and you're on the Private profile).
-3. **Server is running** and bound to `0.0.0.0:8765` (not `127.0.0.1`).
+2. **Firewall** inbound rule for TCP 8767 exists (and you're on the Private profile).
+3. **Server is running** and bound to `0.0.0.0:8767` (not `127.0.0.1`).
 4. **"Require Encrypted Websockets" is OFF** in the world settings.
 5. **Same SSID, no AP isolation** — phone and PC on the same (non-guest) network.
 6. The IP in `/connect` matches the PC's current `ipconfig` IPv4 (it can change on

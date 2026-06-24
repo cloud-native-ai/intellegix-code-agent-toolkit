@@ -6,7 +6,7 @@ ONE FastMCP server process does two jobs on a single asyncio event loop:
 
 1. **Bedrock WebSocket listener** — a ``bedrock.server.Server`` (bedrockpy)
    accepts the connection the phone's Minecraft client makes via the in-game
-   ``/connect <host>:8765`` command. bedrockpy's own ``Server.start()`` is
+   ``/connect <host>:8767`` command. bedrockpy's own ``Server.start()`` is
    *blocking* (it creates its own loop and calls ``run_forever``), which is
    incompatible with running inside FastMCP. So instead, during FastMCP's
    **lifespan** we start the underlying ``websockets`` server on FastMCP's
@@ -46,8 +46,10 @@ from mc_session import McSession
 logger = logging.getLogger(__name__)
 
 # Listener bind config. 0.0.0.0 so the phone on the LAN can reach it.
+# Port 8767 (NOT 8765/8766 — those are used by the browser-bridge MCP's WS hub
+# and metrics endpoint respectively; 8765 collides and would break browser-bridge).
 LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 8765
+LISTEN_PORT = 8767
 
 # Module-level singletons. The lifespan owns their construction; tools read the
 # session via the FastMCP Context (lifespan_context) with this as a fallback so
@@ -154,7 +156,7 @@ mcp: FastMCP = FastMCP(
     name="minecraft-bedrock",
     instructions=(
         "Control a Minecraft Bedrock world over its WebSocket command API. "
-        "In-game, run /connect <this-machine-ip>:8765 to attach, then use the "
+        "In-game, run /connect <this-machine-ip>:8767 to attach, then use the "
         "tools to inspect connection status and (in later tasks) run commands."
     ),
     lifespan=lifespan,

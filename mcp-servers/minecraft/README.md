@@ -104,10 +104,43 @@ Get `<PC-LAN-IP>` from `ipconfig`. On success the world is now driveable from Cl
 | `run_command` | Sends a raw slash-command to the connected world and returns its response. |
 | `setblock` | Places a single block at a coordinate (or relative to the player). |
 | `fill` | Fills a cuboid region with a block; auto-chunks past the 32768-block per-fill cap. |
+| `verify_blocks` | World-state "vision": checks that specific blocks are actually placed (`/testforblock` per entry) — confirms a build matches the plan, no rendering required. |
+| `take_screenshot` | Captures a window/region/monitor and returns it to Claude as an image (visual feedback). See **Vision** below. |
 
 **`relative_to_player` note:** `setblock` and `fill` accept a `relative_to_player`
 flag so you can build *at the player* without knowing absolute coordinates — the tool
 wraps the command in `execute as @p at @s run ... ~ ~ ~ ...`. Use it for "build here".
+
+---
+
+## Vision (giving Claude eyes)
+
+The Bedrock WebSocket protocol **cannot return screenshots** — and in this setup the
+world renders on your **iPhone**, not the PC, so there is nothing for the PC to capture
+by default. Two channels are provided:
+
+- **`verify_blocks` (recommended primary)** — asks the world for the truth via
+  `/testforblock`. Works regardless of where (or whether) the world is rendered, and is
+  never stale or obscured by mobile UI. Use it to confirm a build landed: pass a list of
+  `{x, y, z, block}` and it reports matched vs. mismatched.
+
+- **`take_screenshot` (actual pixels)** — captures a **window on the PC** that is showing
+  the game. Since the game is on the phone, first make the game visible on the PC by
+  **either**:
+  1. **(Recommended)** running a **second Bedrock client on the PC** (Windows 10/11
+     Edition) joined to the same world, then pass `window_title_substring="Minecraft"`; or
+  2. **AirPlay-mirroring the iPhone** to the PC with a receiver app, then pass that app's
+     window title (e.g. `window_title_substring="LonelyScreen"`).
+
+  You can also pass an explicit `region=(left, top, width, height)` or capture a whole
+  `monitor` (1 = primary). Capture deps (`mss`, `pygetwindow`) install from
+  `requirements.txt`; they're lazy-imported so the rest of the server (and CI) runs
+  without them.
+
+  > **Gotcha:** a screenshot can show the *wrong* thing — a stale mirror, a mobile UI
+  > overlay, or an observer client looking the wrong way — while `verify_blocks` stays
+  > truthful. Prefer `verify_blocks` for "did it build correctly"; use `take_screenshot`
+  > for final aesthetic inspection.
 
 ---
 

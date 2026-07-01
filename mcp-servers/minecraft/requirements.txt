@@ -9,3 +9,12 @@
 fastmcp>=3.3
 bedrockpy==1.0.1
 websockets>=11,<12
+
+# Vision tools (take_screenshot). mss grabs pixels; Pillow downscales (LANCZOS)
+# to a token-efficient max-edge and encodes — the vision-token lever for Opus;
+# pygetwindow targets a specific window by title. Windows/macOS only — vision.py
+# lazy-imports all three inside the capture functions, so CI (which installs none
+# of these) still imports the pure helpers fine.
+mss>=9
+pygetwindow>=0.0.9
+pillow>=10

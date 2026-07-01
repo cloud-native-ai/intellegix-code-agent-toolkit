@@ -38,9 +38,17 @@ from typing import Any, Optional
 
 from bedrock.server import Server
 from fastmcp import Context, FastMCP
+
+try:
+    from fastmcp import Image  # FastMCP image-return type → model vision input
+except ImportError:  # pragma: no cover - fastmcp Image location varies by version
+    from fastmcp.utilities.types import Image
+
+import vision  # CI-safe screen-capture helper (heavy deps imported lazily)
 from websockets import server as wss
 
 import mcs_build
+import structures
 from mc_session import McSession
 
 logger = logging.getLogger(__name__)
@@ -56,6 +64,56 @@ LISTEN_PORT = 8767
 # ``connect_status`` works regardless of how the tool is invoked.
 _BEDROCK: Optional[Server] = None
 _SESSION: Optional[McSession] = None
+
+# --------------------------------------------------------------------------- #
+# Build-state cache (Phase 1.5): a tiny on-disk summary of what's been placed so
+# a restarted session can re-orient WITHOUT spending tokens on screenshots. It is
+# a drift-tolerant HINT (blocks can be changed in-world externally) — re-verify
+# on demand. Records bounding box, per-block counts, and the recent ops.
+# --------------------------------------------------------------------------- #
+import json
+import pathlib
+
+_BUILD_STATE_PATH = pathlib.Path(__file__).resolve().parent / "build_state.json"
+_BUILD_STATE: dict[str, Any] = {"ops": 0, "by_block": {}, "bbox": None, "recent": []}
+
+
+def _expand_bbox(bbox: Optional[list[int]], c1: tuple[int, int, int], c2: tuple[int, int, int]) -> list[int]:
+    xs = [c1[0], c2[0]]; ys = [c1[1], c2[1]]; zs = [c1[2], c2[2]]
+    if bbox is None:
+        return [min(xs), min(ys), min(zs), max(xs), max(ys), max(zs)]
+    return [
+        min(bbox[0], *xs), min(bbox[1], *ys), min(bbox[2], *zs),
+        max(bbox[3], *xs), max(bbox[4], *ys), max(bbox[5], *zs),
+    ]
+
+
+def _record_placement(
+    kind: str, block: str, c1: tuple[int, int, int], c2: tuple[int, int, int], count: Optional[int]
+) -> None:
+    """Record a successful placement into the build-state cache (best-effort)."""
+    try:
+        if count is None:  # a fill — volume of the box
+            count = (abs(c2[0] - c1[0]) + 1) * (abs(c2[1] - c1[1]) + 1) * (abs(c2[2] - c1[2]) + 1)
+        _BUILD_STATE["ops"] += 1
+        _BUILD_STATE["by_block"][block] = _BUILD_STATE["by_block"].get(block, 0) + count
+        _BUILD_STATE["bbox"] = _expand_bbox(_BUILD_STATE["bbox"], c1, c2)
+        rec = _BUILD_STATE["recent"]
+        rec.append({"kind": kind, "block": block, "c1": list(c1), "c2": list(c2), "n": count})
+        del rec[:-50]  # keep last 50
+        _BUILD_STATE_PATH.write_text(json.dumps(_BUILD_STATE), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — a cache write must never break a placement
+        pass
+
+
+def _load_build_state() -> None:
+    """Load the persisted build-state on startup (best-effort)."""
+    global _BUILD_STATE
+    try:
+        if _BUILD_STATE_PATH.exists():
+            _BUILD_STATE = json.loads(_BUILD_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _make_sender(bedrock_server: Server):
@@ -261,12 +319,10 @@ async def setblock(
         x, y, z, block, states=states, relative_to_player=relative_to_player
     )
     res = await _require_session().run(cmd)
-    return {
-        "ok": res.ok,
-        "status_code": res.status_code,
-        "message": res.message,
-        "command": cmd,
-    }
+    if res.ok:
+        _record_placement("setblock", block, (x, y, z), (x, y, z), 1)
+        return {"ok": True}  # terse: success needs no echo (cuts per-call output tokens)
+    return {"ok": False, "status_code": res.status_code, "message": res.message, "command": cmd}
 
 
 @mcp.tool
@@ -298,10 +354,8 @@ async def fill(
         relative_to_player: Run relative to the connected player's position.
 
     Returns:
-        ``{"ok": bool, "chunks": int, "failed": list[dict], "first_error":
-        str | None}``. ``ok`` is True only when every chunk succeeded;
-        ``failed`` lists each non-ok chunk's command/status/message;
-        ``first_error`` surfaces the first non-zero status message.
+        ``{"ok": bool, "chunks": int, "failed_count": int, "first_error": str|None}``
+        (terse — no per-chunk list; ``first_error`` carries the failing message).
 
     Raises:
         ValueError: If ``mode`` is invalid or the block/states are unsafe.
@@ -321,29 +375,200 @@ async def fill(
     )
     session = _require_session()
 
-    failed: list[dict[str, Any]] = []
+    failed = 0
     first_error: Optional[str] = None
     for cmd in cmds:
         res = await session.run(cmd)
         if not res.ok:
-            failed.append(
-                {
-                    "command": cmd,
-                    "status_code": res.status_code,
-                    "message": res.message,
-                }
-            )
+            failed += 1
             if first_error is None:
                 first_error = res.message
+    if failed == 0:
+        _record_placement("fill", block, (x1, y1, z1), (x2, y2, z2), None)
+    # terse: drop the full per-chunk failed[] list (it reloads every turn) —
+    # first_error carries the failing region's message for recovery.
+    return {"ok": not failed, "chunks": len(cmds), "failed_count": failed, "first_error": first_error}
+
+
+@mcp.tool
+def take_screenshot(
+    window_title_substring: Optional[str] = None,
+    region: Optional[tuple[int, int, int, int]] = None,
+    monitor: int = 1,
+    max_edge: int = vision.MAX_EDGE_DEFAULT,
+    fmt: str = "jpeg",
+) -> Image:
+    """MILESTONE/aesthetic checks only — for structural truth use ``verify_blocks``.
+
+    Captures the PC window showing the game (2nd Bedrock client or AirPlay mirror;
+    the world renders on the phone, and the Bedrock WS returns no images).
+    Downscaled to ``max_edge`` longest side (Opus vision-token control); ``fmt`` is
+    wire-only. Token-expensive — screenshot at build milestones, not per block.
+
+    Args:
+        window_title_substring: Window whose title contains this (e.g. ``"Minecraft"``).
+        region: ``(left, top, width, height)`` pixels instead.
+        monitor: 1-based monitor index for a full-monitor capture (1 = primary).
+        max_edge: Longest-edge downscale clamp (default ~1456); ``<=0`` disables.
+        fmt: ``"jpeg"`` (default) or ``"png"`` — wire size only, not token count.
+    """
+    img = vision.capture(
+        window_title_substring=window_title_substring,
+        region=region,
+        monitor=monitor,
+        max_edge=max_edge,
+        fmt=fmt,
+    )
+    return Image(data=img, format="jpeg" if fmt.lower() in ("jpg", "jpeg") else "png")
+
+
+@mcp.tool
+async def verify_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Verify specific blocks are actually placed — world-state "vision" over WS.
+
+    The robust feedback channel for this phone-rendered topology: instead of
+    pixels, ask the world for the truth. Runs Bedrock ``/testforblock`` per entry
+    (a success means the block at that position matches the expected id), so the
+    model can confirm a build landed as planned regardless of where — or whether
+    — it is being rendered.
+
+    Args:
+        blocks: List (≤256) of ``{"x": int, "y": int, "z": int, "block": str}``
+            entries; block id may be bare (``stone``) or namespaced
+            (``minecraft:oak_stairs``).
+
+    Returns:
+        ``{"checked": int, "matched": int, "mismatched": list[dict]}`` — each
+        mismatch carries its coords, the expected block, and the Bedrock message.
+
+    Raises:
+        ValueError: If ``blocks`` is empty, too large, or an entry is malformed
+            or has an injection-unsafe block id.
+        RuntimeError: If no Bedrock listener session is available.
+    """
+    import re
+
+    if not isinstance(blocks, list) or not blocks:
+        raise ValueError("blocks must be a non-empty list")
+    # Raised 256 -> 1024 to cut verification round-trips ~4x. NOTE: this runs one
+    # /testforblock per coord in a tight loop; if a 1024-batch ever trips Bedrock
+    # command-spam / tick degradation in practice, lower this constant.
+    if len(blocks) > 1024:
+        raise ValueError("at most 1024 blocks per call")
+
+    session = _require_session()
+    matched = 0
+    mismatched: list[dict[str, Any]] = []
+    for b in blocks:
+        try:
+            x, y, z = int(b["x"]), int(b["y"]), int(b["z"])
+            block = str(b["block"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"bad block entry {b!r}: {exc}") from exc
+        if not re.fullmatch(r"[A-Za-z0-9_:]+", block):
+            raise ValueError(f"injection-unsafe block id: {block!r}")
+        res = await session.run(f"testforblock {x} {y} {z} {block}")
+        if res.ok:
+            matched += 1
+        else:
+            mismatched.append(
+                {"x": x, "y": y, "z": z, "expected": block, "message": res.message}
+            )
+    return {"checked": len(blocks), "matched": matched, "mismatched": mismatched}
+
+
+@mcp.tool
+async def build_structure(spec: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a whole structure server-side from a run-encoded spec — NO per-block
+    model round-trips (the big token win for large builds).
+
+    Each spec entry is ONE primitive (a whole box/line/ring/helix/rail_run/scatter
+    described once, not block-by-block). The server expands and runs all commands
+    in a tight loop and returns a terse summary. It is **idempotent** (re-running
+    is safe — setblock/fill overwrite), so on a partial failure you can fix the
+    failing primitive and re-call; ``failed_primitive`` tells you WHICH one and
+    where, so you don't need a screenshot to diagnose.
+
+    Args:
+        spec: List (≤256) of primitives. Types + params:
+            ``box`` {x1,y1,z1,x2,y2,z2,block,states?,mode?};
+            ``line`` {x1,y1,z1,x2,y2,z2,block,states?};
+            ``ring`` {cx,cy,cz,radius,block,states?,plane?(xz|xy|zy)};
+            ``helix`` {cx,cy,cz,radius,height,block,states?,turns?,plane?};
+            ``rail_run`` {path:[[x,y,z]...],powered?,rail?,power_block?};
+            ``scatter`` {x1,y1,z1,x2,y2,z2,block,count,seed?,states?}.
+
+    Returns:
+        Terse, cache-friendly (NO timestamps/volatile fields):
+        ``{"placed": int, "failed_count": int, "first_error": str|None,
+        "failed_primitive": {"index": int, "type": str}|None}``.
+
+    Raises:
+        ValueError: If ``spec`` is empty/too large or any primitive is malformed
+            (unknown type, missing params, injection-unsafe block id).
+        RuntimeError: If no Bedrock listener session is available.
+    """
+    if not isinstance(spec, list) or not spec:
+        raise ValueError("spec must be a non-empty list of primitives")
+    if len(spec) > 256:
+        raise ValueError("at most 256 primitives per build_structure call")
+
+    # Expand ALL primitives first so a malformed spec fails fast before any
+    # block is placed (partial half-built structures are worse than none).
+    expanded: list[tuple[int, dict[str, Any], list[str]]] = []
+    for idx, prim in enumerate(spec):
+        expanded.append((idx, prim, structures.primitive_commands(prim)))
+
+    session = _require_session()
+    placed = 0
+    failed_count = 0
+    first_error: Optional[str] = None
+    failed_primitive: Optional[dict[str, Any]] = None
+
+    for idx, prim, cmds in expanded:
+        prim_ok = True
+        for cmd in cmds:
+            res = await session.run(cmd)
+            if res.ok:
+                placed += 1
+            else:
+                failed_count += 1
+                prim_ok = False
+                if first_error is None:
+                    first_error = res.message
+                    failed_primitive = {"index": idx, "type": prim.get("type")}
+        if prim_ok:
+            try:
+                c1, c2 = structures.primitive_bbox(prim)
+                _record_placement(str(prim.get("type")), str(prim.get("block", prim.get("rail", "rail"))), c1, c2, None)
+            except Exception:  # noqa: BLE001 — build-state hint is best-effort
+                pass
 
     return {
-        "ok": not failed,
-        "chunks": len(cmds),
-        "failed": failed,
+        "placed": placed,
+        "failed_count": failed_count,
         "first_error": first_error,
+        "failed_primitive": failed_primitive,
     }
+
+
+@mcp.tool
+def build_state() -> dict[str, Any]:
+    """Re-orient on what's already been built — cheap alternative to a screenshot.
+
+    Returns the server-side build-state cache (bounding box, per-block counts, and
+    the last ~50 placement ops) so a restarted session knows WHERE it was building
+    and WHAT is placed without spending vision tokens. It is a drift-tolerant
+    hint — verify specific blocks with ``verify_blocks`` if certainty is needed.
+
+    Returns:
+        ``{"ops": int, "bbox": [x1,y1,z1,x2,y2,z2]|None, "by_block": {block: count},
+        "recent": [{kind, block, c1, c2, n}, ...]}``.
+    """
+    return _BUILD_STATE
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    _load_build_state()
     mcp.run()
